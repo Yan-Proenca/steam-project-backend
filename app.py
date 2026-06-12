@@ -41,27 +41,25 @@ app = Flask(__name__)
 # Garante que se FRONTEND_ORIGIN não existir, use "*" temporariamente para o app não quebrar
 CORS(app, resources={r"/api/*": {"origins": os.getenv("FRONTEND_ORIGIN", "*")}})
 
-SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")  # Para o frontend React
-SUPABASE_SERVICE_KEY = os.getenv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY")   # Service Role Key — ignora RLS
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 PROFESSOR_MASTER_KEY = os.getenv("PROFESSOR_MASTER_KEY")   # Substitui FLASK_SECRET_KEY
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     print("⚠️ ALERTA CRÍTICO: SUPABASE_URL ou SUPABASE_SERVICE_KEY não foram detectadas no ambiente!")
 
 # Inicialização segura do Supabase
-supabase: Client = create_client(SUPABASE_URL or "https://placeholder.supabase.co", SUPABASE_SERVICE_KEY or "placeholder")
-
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY
+)
 # Inicialização da API do Gemini baseada na versão carregada (google-genai >= 1.0.0)
 # A nova SDK busca automaticamente a variável GEMINI_API_KEY do sistema.
 try:
-    ai_client = genai.Client()
-except Exception as ai_err:
-    print(f"⚠️ Erro ao instanciar o cliente Gemini GenAI: {ai_err}")
-    ai_client = None
-
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-gemini_client = genai.Client()
+    gemini_client = genai.Client()
+except Exception as e:
+    print(e)
+    gemini_client = None
 
 
 # ===========================================================================
@@ -337,6 +335,14 @@ def _build_equipe_map_periodo(sala_id: str, periodo_id):
         .execute().data
     )
     return {m["aluno_id"]: equipes_map.get(m["equipe_id"], "—") for m in membros_r}
+
+
+@app.route("/")
+def health():
+    return {
+        "status": "online",
+        "service": "steam-hub-api"
+    }
 
 
 # ===========================================================================
@@ -1687,4 +1693,5 @@ def excluir_material(current_user, sala_id, material_id):
 # ===========================================================================
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
