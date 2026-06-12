@@ -38,15 +38,30 @@ from google.genai import types
 load_dotenv()
 
 app = Flask(__name__)
+# Garante que se FRONTEND_ORIGIN não existir, use "*" temporariamente para o app não quebrar
 CORS(app, resources={r"/api/*": {"origins": os.getenv("FRONTEND_ORIGIN", "*")}})
 
+# Coleta de variáveis com fallbacks seguros para evitar travamento de compilação
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
+gemini_key = os.getenv("GEMINI_API_KEY")
 
-SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")  # Para o frontend React
-SUPABASE_SERVICE_KEY = os.getenv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY")   # Service Role Key — ignora RLS
-PROFESSOR_MASTER_KEY = os.getenv("PROFESSOR_MASTER_KEY")   # Substitui FLASK_SECRET_KEY
+if not supabase_url or not supabase_key:
+    print("⚠️ ALERTA CRÍTICO: SUPABASE_URL ou SUPABASE_SERVICE_KEY não foram detectadas no ambiente!")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-gemini_client = genai.Client()
+# Inicialização segura do Supabase
+supabase: Client = create_client(supabase_url or "https://placeholder.supabase.co", supabase_key or "placeholder")
+
+# Inicialização da API do Gemini baseada na versão carregada (google-genai >= 1.0.0)
+# A nova SDK busca automaticamente a variável GEMINI_API_KEY do sistema.
+try:
+    ai_client = genai.Client()
+except Exception as ai_err:
+    print(f"⚠️ Erro ao instanciar o cliente Gemini GenAI: {ai_err}")
+    ai_client = None
+
+
+
 
 
 # ===========================================================================
