@@ -41,8 +41,8 @@ app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": os.getenv("FRONTEND_ORIGIN", "*")}})
 
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")   # Service Role Key — ignora RLS
+SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")  # Para o frontend React
+SUPABASE_SERVICE_KEY = os.getenv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY")   # Service Role Key — ignora RLS
 PROFESSOR_MASTER_KEY = os.getenv("PROFESSOR_MASTER_KEY")   # Substitui FLASK_SECRET_KEY
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
