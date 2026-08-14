@@ -39,7 +39,7 @@ load_dotenv()
 
 app = Flask(__name__)
 # Garante que se FRONTEND_ORIGIN não existir, use "*" temporariamente para o app não quebrar
-CORS(app, resources={r"/api/*": {"origins": os.getenv("FRONTEND_ORIGIN", "*")}})
+CORS(app)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
