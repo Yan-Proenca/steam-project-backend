@@ -16,7 +16,10 @@ load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+<<<<<<< HEAD
 
+=======
+>>>>>>> 142de15c1be654e566443ef05440616a277c660d
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
