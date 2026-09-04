@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import functools
 import uuid
 from datetime import datetime, timezone
@@ -58,6 +59,52 @@ def _parse_dt(value):
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
+
+
+def _uuid_valido(valor):
+    """
+    True se `valor` for None/vazio (campo opcional) OU um UUID bem formado.
+    Usada para validar FKs opcionais (ex: sticker_recompensa_id) ANTES do
+    insert/update, trocando um 500 cru do Postgres (22P02) por um 400
+    amigável — geralmente sinal de que o front mandou o campo errado
+    (ex: o `nome`/slug do sticker em vez do `id`).
+    """
+    if not valor:
+        return True
+    try:
+        uuid.UUID(str(valor))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def _parse_data_br(valor):
+    """
+    Normaliza uma data recebida do body para o formato ISO (AAAA-MM-DD)
+    que o Postgres espera, aceitando dois formatos de entrada:
+      - "DD/MM/AAAA"      (formato brasileiro — o que o front deve enviar)
+      - "AAAA-MM-DD..."   (ISO, já pronto — aceito como fallback)
+    Retorna None se `valor` for vazio/None (campo opcional).
+    Levanta ValueError com mensagem amigável se o formato for irreconhecível
+    ou a data não existir (ex: 31/02/2026).
+    """
+    if not valor:
+        return None
+    valor = str(valor).strip()
+
+    if re.match(r"^\d{4}-\d{2}-\d{2}", valor):
+        return valor
+
+    m = re.match(r"^(\d{2})/(\d{2})/(\d{4})$", valor)
+    if not m:
+        raise ValueError("Data inválida. Use o formato DD/MM/AAAA.")
+
+    dia, mes, ano = m.groups()
+    try:
+        datetime(int(ano), int(mes), int(dia))  # valida que a data existe de fato
+    except ValueError:
+        raise ValueError("Data inválida. Confira o dia e o mês informados.")
+    return f"{ano}-{mes}-{dia}"
 
 
 def _success(data=None, status=200):
@@ -759,6 +806,15 @@ def cadastrar_missao(current_user, sala_id):
         if (cnt.count or 0) >= 5:
             return _error("Limite atingido: este período já possui o máximo de 5 missões.", 400)
 
+    sticker_recompensa_id = body.get("sticker_recompensa_id") or None
+    if not _uuid_valido(sticker_recompensa_id):
+        return _error("Sticker inválido. Selecione um sticker da lista.", 400)
+
+    try:
+        data_limite = _parse_data_br(body.get("data_limite"))
+    except ValueError as e:
+        return _error(str(e), 400)
+
     try:
         nova = {
             "sala_id": sala_id,
@@ -766,8 +822,8 @@ def cadastrar_missao(current_user, sala_id):
             "descricao": body.get("descricao"),
             "ordem": ordem,
             "xp_reward": int(body.get("xp_reward", 0) or 0),
-            "sticker_recompensa_id": body.get("sticker_recompensa_id") or None,
-            "data_limite": body.get("data_limite") or None,
+            "sticker_recompensa_id": sticker_recompensa_id,
+            "data_limite": data_limite,
             "periodo_id": periodo_id,
             "peso_nota": float(body.get("peso_nota", 1) or 1),
         }
@@ -812,14 +868,23 @@ def editar_missao(current_user, sala_id, missao_id):
         if (cnt.count or 0) >= 5:
             return _error("Não é possível mover esta missão: o período de destino já tem 5 missões.", 400)
 
+    sticker_recompensa_id = body.get("sticker_recompensa_id") or None
+    if not _uuid_valido(sticker_recompensa_id):
+        return _error("Sticker inválido. Selecione um sticker da lista.", 400)
+
+    try:
+        data_limite = _parse_data_br(body.get("data_limite"))
+    except ValueError as e:
+        return _error(str(e), 400)
+
     try:
         dados = {
             "titulo": body.get("titulo"),
             "descricao": body.get("descricao"),
             "ordem": ordem,
             "xp_reward": int(body.get("xp_reward", 0) or 0),
-            "sticker_recompensa_id": body.get("sticker_recompensa_id") or None,
-            "data_limite": body.get("data_limite") or None,
+            "sticker_recompensa_id": sticker_recompensa_id,
+            "data_limite": data_limite,
             "periodo_id": periodo_id,
             "peso_nota": float(body.get("peso_nota", 1) or 1),
         }
@@ -1676,28 +1741,54 @@ def dashboard_aluno(current_user):
         "quizzes_disponiveis": quizzes_disponiveis,
     })
 
-@app.route("/api/aluno/biblioteca", methods=["GET"])
-@token_required
-def biblioteca_aluno(current_user):
-    db = get_user_supabase()
-    aluno_id = current_user["id"]
-    sala_id = _get_vinculo_aluno(db, aluno_id)
-
-    if not sala_id:
-        return _success({"materiais": []})
-
+def _biblioteca_da_sala(db, sala_id, missao_id_filtro=None):
     q = (
         db.table("biblioteca_materiais")
         .select("*, missoes(id, titulo, ordem)")
         .eq("sala_id", sala_id)
         .order("criado_em", desc=True)
     )
+    if missao_id_filtro:
+        q = q.eq("missao_id", missao_id_filtro)
+    return q.execute().data
 
-    missao_id = request.args.get("missao_id", "")
-    if missao_id:
-        q = q.eq("missao_id", missao_id)
 
-    materiais = q.execute().data
+@app.route("/api/aluno/biblioteca", methods=["GET"])
+@token_required
+def biblioteca_aluno(current_user):
+    db = get_user_supabase()
+    sala_id = _get_vinculo_aluno(db, current_user["id"])
+
+    if not sala_id:
+        return _success({"materiais": []})
+
+    materiais = _biblioteca_da_sala(db, sala_id, request.args.get("missao_id", ""))
+    return _success({"materiais": materiais})
+
+
+@app.route("/api/aluno/salas/<sala_id>/biblioteca", methods=["GET"])
+@token_required
+def biblioteca_aluno_por_sala(current_user, sala_id):
+    """
+    Alias de `/api/aluno/biblioteca` que aceita `sala_id` na URL — existe só
+    por compatibilidade com o app mobile, que chama esse padrão (o mesmo da
+    rota do professor). O `sala_id` do path é tratado como não-confiável:
+    a fonte de verdade continua sendo o vínculo real do aluno
+    (`_get_vinculo_aluno`); se não bater, 403. Isso evita que o aluno consiga
+    "espiar" a biblioteca de outra sala só editando a URL — mesmo que o RLS
+    já bloqueasse a leitura, é a mesma camada 2 de checagem explícita usada
+    no restante do arquivo (ver `_sala_do_professor` e afins).
+
+    Prefira migrar o app para `/api/aluno/biblioteca` (sem sala_id) quando
+    possível: o aluno só pertence a 1 sala, então o path param é redundante
+    e essa rota pode ser removida no futuro.
+    """
+    db = get_user_supabase()
+    sala_vinculada = _get_vinculo_aluno(db, current_user["id"])
+    if not sala_vinculada or sala_vinculada != sala_id:
+        return _error("Sala não encontrada ou sem permissão.", 403)
+
+    materiais = _biblioteca_da_sala(db, sala_id, request.args.get("missao_id", ""))
     return _success({"materiais": materiais})
 
 @app.route("/api/aluno/missoes/<missao_id>", methods=["GET"])
