@@ -1676,6 +1676,29 @@ def dashboard_aluno(current_user):
         "quizzes_disponiveis": quizzes_disponiveis,
     })
 
+@app.route("/api/aluno/biblioteca", methods=["GET"])
+@token_required
+def biblioteca_aluno(current_user):
+    db = get_user_supabase()
+    aluno_id = current_user["id"]
+    sala_id = _get_vinculo_aluno(db, aluno_id)
+
+    if not sala_id:
+        return _success({"materiais": []})
+
+    q = (
+        db.table("biblioteca_materiais")
+        .select("*, missoes(id, titulo, ordem)")
+        .eq("sala_id", sala_id)
+        .order("criado_em", desc=True)
+    )
+
+    missao_id = request.args.get("missao_id", "")
+    if missao_id:
+        q = q.eq("missao_id", missao_id)
+
+    materiais = q.execute().data
+    return _success({"materiais": materiais})
 
 @app.route("/api/aluno/missoes/<missao_id>", methods=["GET"])
 @token_required
