@@ -2018,4 +2018,4 @@ def responder_quiz(current_user, quiz_id):
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run()
