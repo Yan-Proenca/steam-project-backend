@@ -15,8 +15,13 @@ from google.genai import types
 
 load_dotenv()
 
+# Obtenha a URL do front-end a partir do ambiente ou use o padrão local para desenvolvimento
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+
 app = Flask(__name__)
-CORS(app)
+
+# Permite chamadas do front-end hospedado em produção
+CORS(app, resources={r"/api/*": {"origins": FRONTEND_ORIGIN}}, supports_credentials=True)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
