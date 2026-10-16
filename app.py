@@ -1576,6 +1576,19 @@ def desempenho_consolidado(current_user, sala_id):
 # =============================================================================
 # PROFESSOR — BIBLIOTECA DE MATERIAIS
 # =============================================================================
+# =============================================================================
+# PROFESSOR — BIBLIOTECA DE MATERIAIS
+# =============================================================================
+def _ler_corpo_material():
+    """
+    Lê os campos do material tanto de JSON (Content-Type: application/json)
+    quanto de multipart/form-data (quando um anexo é enviado junto).
+    """
+    if request.content_type and "multipart/form-data" in request.content_type:
+        return request.form, request.files.get("anexo")
+    return (request.get_json(silent=True) or {}), None
+
+
 @app.route("/api/professor/salas/<sala_id>/biblioteca", methods=["GET"])
 @token_required
 @professor_required
@@ -1603,7 +1616,7 @@ def criar_material(current_user, sala_id):
     if not _sala_do_professor(db, sala_id, current_user["id"]):
         return _error("Sala não encontrada ou sem permissão.", 404)
 
-    body = request.get_json() or {}
+    body, anexo = _ler_corpo_material()
     titulo = body.get("titulo", "").strip()
     if not titulo:
         return _error("O título do material é obrigatório.")
@@ -1612,6 +1625,22 @@ def criar_material(current_user, sala_id):
     if missao_id and not _missao_da_sala(db, missao_id, sala_id, current_user["id"]):
         return _error("Missão inválida para esta sala.", 404)
 
+    # 🔒 Anexo opcional enviado para o bucket compartilhado "anexos_geral"
+    anexo_url = None
+    if anexo and anexo.filename:
+        anexo_url, erro_anexo = _upload_anexo_geral(db, anexo, "biblioteca/")
+        if erro_anexo:
+            return _error(erro_anexo, 400)
+
+    raw_links = body.get("links", [])
+    if isinstance(raw_links, str):
+        try:
+            links = json.loads(raw_links)
+        except json.JSONDecodeError:
+            links = []
+    else:
+        links = raw_links
+
     try:
         r = db.table("biblioteca_materiais").insert({
             "professor_id": current_user["id"],
@@ -1619,7 +1648,8 @@ def criar_material(current_user, sala_id):
             "missao_id": missao_id,
             "titulo": titulo,
             "descricao": body.get("descricao") or None,
-            "links": body.get("links", []),
+            "links": links,
+            "anexo_url": anexo_url,
         }).execute()
         return _success(r.data[0], 201)
     except Exception as e:
@@ -1631,10 +1661,11 @@ def criar_material(current_user, sala_id):
 @professor_required
 def editar_material(current_user, sala_id, material_id):
     db = get_user_supabase()
-    if not _material_da_sala(db, material_id, sala_id, current_user["id"]):
+    material_atual = _material_da_sala(db, material_id, sala_id, current_user["id"])
+    if not material_atual:
         return _error("Material não encontrado ou sem permissão.", 404)
 
-    body = request.get_json() or {}
+    body, anexo = _ler_corpo_material()
     titulo = body.get("titulo", "").strip()
     if not titulo:
         return _error("O título do material é obrigatório.")
@@ -1643,13 +1674,30 @@ def editar_material(current_user, sala_id, material_id):
     if missao_id and not _missao_da_sala(db, missao_id, sala_id, current_user["id"]):
         return _error("Missão inválida para esta sala.", 404)
 
+    raw_links = body.get("links", [])
+    if isinstance(raw_links, str):
+        try:
+            links = json.loads(raw_links)
+        except json.JSONDecodeError:
+            links = []
+    else:
+        links = raw_links
+
+    dados = {
+        "titulo": titulo,
+        "descricao": body.get("descricao") or None,
+        "missao_id": missao_id,
+        "links": links,
+    }
+
+    if anexo and anexo.filename:
+        anexo_url, erro_anexo = _upload_anexo_geral(db, anexo, "biblioteca/")
+        if erro_anexo:
+            return _error(erro_anexo, 400)
+        dados["anexo_url"] = anexo_url
+
     try:
-        r = db.table("biblioteca_materiais").update({
-            "titulo": titulo,
-            "descricao": body.get("descricao") or None,
-            "missao_id": missao_id,
-            "links": body.get("links", []),
-        }).eq("id", material_id).execute()
+        r = db.table("biblioteca_materiais").update(dados).eq("id", material_id).execute()
         return _success(r.data[0] if r.data else None)
     except Exception as e:
         return _error(str(e), 500)
@@ -1667,7 +1715,6 @@ def excluir_material(current_user, sala_id, material_id):
         return _success({"message": "Material removido."})
     except Exception as e:
         return _error(str(e), 500)
-
 
 # =============================================================================
 # PROFESSOR — GERAÇÃO DE QUIZ COM GEMINI (não acessa dados de sala/aluno)
