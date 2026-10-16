@@ -124,6 +124,101 @@ def _get_token_from_header():
 
 
 # =============================================================================
+# VALIDAÇÃO DE E-MAIL E SENHA (cadastro/login)
+# =============================================================================
+_EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
+
+# Mínimo 8 caracteres, 1 maiúscula, 1 minúscula, 1 número, 1 caractere especial
+_SENHA_MAIUSCULA = re.compile(r"[A-Z]")
+_SENHA_MINUSCULA = re.compile(r"[a-z]")
+_SENHA_NUMERO = re.compile(r"[0-9]")
+_SENHA_ESPECIAL = re.compile(r"[^A-Za-z0-9]")
+
+
+def _normalizar_email(valor: str) -> str:
+    """strip() + lower() — normalização padrão aplicada antes de validar/gravar."""
+    return (valor or "").strip().lower()
+
+
+def _validar_email(email: str):
+    """
+    Valida formato de e-mail via regex, já assumindo que `email` foi
+    normalizado por `_normalizar_email` (strip + lower) antes.
+    Retorna (True, None) se válido, ou (False, "mensagem de erro").
+    """
+    if not email:
+        return False, "O e-mail é obrigatório."
+    if not _EMAIL_REGEX.match(email):
+        return False, "E-mail inválido. Verifique o formato digitado."
+    return True, None
+
+
+def _validar_senha(senha: str):
+    """
+    Exige mínimo de 8 caracteres, com pelo menos 1 letra maiúscula,
+    1 letra minúscula, 1 número e 1 caractere especial.
+    Retorna (True, None) se válida, ou (False, "mensagem de erro").
+    """
+    if not senha:
+        return False, "A senha é obrigatória."
+    if len(senha) < 8:
+        return False, "A senha deve ter no mínimo 8 caracteres."
+    if not _SENHA_MAIUSCULA.search(senha):
+        return False, "A senha deve conter pelo menos 1 letra maiúscula."
+    if not _SENHA_MINUSCULA.search(senha):
+        return False, "A senha deve conter pelo menos 1 letra minúscula."
+    if not _SENHA_NUMERO.search(senha):
+        return False, "A senha deve conter pelo menos 1 número."
+    if not _SENHA_ESPECIAL.search(senha):
+        return False, "A senha deve conter pelo menos 1 caractere especial (ex: !@#$%&*)."
+    return True, None
+
+
+# =============================================================================
+# UPLOAD DE ARQUIVOS — BUCKET ÚNICO "anexos_geral"
+# =============================================================================
+_ANEXOS_EXTENSOES_PERMITIDAS = {
+    "pdf", "docx", "pptx", "xlsx", "zip",
+    "png", "jpg", "jpeg", "txt", "py", "ipynb",
+}
+_ANEXOS_TAMANHO_MAXIMO_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+def _upload_anexo_geral(db: Client, arquivo, prefixo: str):
+    """
+    Sobe `arquivo` (werkzeug FileStorage) para o bucket compartilhado
+    "anexos_geral", sob o prefixo informado (ex: "missoes/", "entregas/"),
+    com nome gerado via uuid.uuid4() para evitar colisões/sobrescritas.
+
+    Retorna (url_publica, None) em caso de sucesso, ou (None, "mensagem de
+    erro") em caso de falha de validação (extensão/tamanho) — nunca lança
+    exceção por validação, só por falha de rede/Storage.
+    """
+    if not arquivo or not arquivo.filename:
+        return None, "Nenhum arquivo selecionado."
+
+    extensao = arquivo.filename.rsplit(".", 1)[-1].lower() if "." in arquivo.filename else ""
+    if extensao not in _ANEXOS_EXTENSOES_PERMITIDAS:
+        permitidas = ", ".join(sorted(_ANEXOS_EXTENSOES_PERMITIDAS))
+        return None, f"Tipo de arquivo não permitido. Use um dos formatos: {permitidas}."
+
+    conteudo = arquivo.read()
+    if len(conteudo) > _ANEXOS_TAMANHO_MAXIMO_BYTES:
+        return None, "Arquivo muito grande. O limite é 20 MB."
+
+    # 🔒 Nome sempre gerado via uuid4() — nunca usa o nome original do
+    # arquivo enviado pelo usuário, evitando colisões e path traversal.
+    nome_arquivo = f"{prefixo}{uuid.uuid4()}.{extensao}"
+    db.storage.from_("anexos_geral").upload(
+        path=nome_arquivo,
+        file=conteudo,
+        file_options={"content-type": arquivo.content_type or "application/octet-stream"},
+    )
+    url = db.storage.from_("anexos_geral").get_public_url(nome_arquivo)
+    return url, None
+
+
+# =============================================================================
 # CLIENTES SUPABASE POR REQUISIÇÃO (ANON KEY + JWT DO USUÁRIO)
 # =============================================================================
 def _new_anon_client() -> Client:
@@ -489,14 +584,22 @@ def cadastro():
         return _error("Serviço de cadastro indisponível (SUPABASE_SERVICE_KEY não configurada).", 500)
 
     body = request.get_json() or {}
-    email = body.get("email", "").strip()
+    email = _normalizar_email(body.get("email", ""))
     password = body.get("senha", "")
     nome = body.get("nome", "").strip()
     role = body.get("role", "aluno")
     chave_mestra = body.get("chave_mestra", "")
 
-    if not email or not password or not nome:
+    if not nome:
         return _error("Nome, e-mail e senha são obrigatórios.")
+
+    email_ok, email_erro = _validar_email(email)
+    if not email_ok:
+        return _error(email_erro)
+
+    senha_ok, senha_erro = _validar_senha(password)
+    if not senha_ok:
+        return _error(senha_erro)
 
     if role == "professor" and chave_mestra != PROFESSOR_MASTER_KEY:
         return _error("Chave mestra de professor incorreta.", 403)
@@ -539,8 +642,14 @@ def login():
     definido pelo RLS.
     """
     body = request.get_json() or {}
-    email = body.get("email", "")
+    email = _normalizar_email(body.get("email", ""))
     password = body.get("senha", "")
+
+    email_ok, email_erro = _validar_email(email)
+    if not email_ok:
+        return _error(email_erro)
+    if not password:
+        return _error("A senha é obrigatória.")
 
     try:
         auth_client = _new_anon_client()
@@ -556,7 +665,7 @@ def login():
 
         perfil_r = (
             user_client.table("perfis")
-            .select("id, nome, role, email, avatar_url, xp")
+            .select("id, nome, role, email, xp")
             .eq("id", response.user.id)
             .execute()
         )
@@ -776,6 +885,18 @@ def excluir_periodo(current_user, sala_id, periodo_id):
 # =============================================================================
 # PROFESSOR — MISSÕES
 # =============================================================================
+def _ler_corpo_missao():
+    """
+    Lê os campos da missão tanto de JSON (Content-Type: application/json)
+    quanto de multipart/form-data (quando um anexo é enviado junto).
+    `request.files` só é populado em requisições multipart; nos demais
+    casos, vem vazio — arquivo é sempre opcional.
+    """
+    if request.content_type and "multipart/form-data" in request.content_type:
+        return request.form, request.files.get("anexo")
+    return (request.get_json(silent=True) or {}), None
+
+
 @app.route("/api/professor/salas/<sala_id>/missoes", methods=["POST"])
 @token_required
 @professor_required
@@ -784,7 +905,7 @@ def cadastrar_missao(current_user, sala_id):
     if not _sala_do_professor(db, sala_id, current_user["id"]):
         return _error("Sala não encontrada ou sem permissão.", 404)
 
-    body = request.get_json() or {}
+    body, anexo = _ler_corpo_missao()
     titulo = body.get("titulo", "").strip()
     if not titulo:
         return _error("O título da missão não pode estar vazio.")
@@ -816,6 +937,14 @@ def cadastrar_missao(current_user, sala_id):
     except ValueError as e:
         return _error(str(e), 400)
 
+    # 🔒 Anexo (opcional) vai para o bucket compartilhado "anexos_geral",
+    # sob o prefixo "missoes/", com nome gerado via uuid4().
+    anexo_url = None
+    if anexo and anexo.filename:
+        anexo_url, erro_anexo = _upload_anexo_geral(db, anexo, "missoes/")
+        if erro_anexo:
+            return _error(erro_anexo, 400)
+
     try:
         nova = {
             "sala_id": sala_id,
@@ -827,6 +956,7 @@ def cadastrar_missao(current_user, sala_id):
             "data_limite": data_limite,
             "periodo_id": periodo_id,
             "peso_nota": float(body.get("peso_nota", 1) or 1),
+            "anexo_url": anexo_url,
         }
         r = db.table("missoes").insert(nova).execute()
         return _success(r.data[0], 201)
@@ -843,7 +973,7 @@ def editar_missao(current_user, sala_id, missao_id):
     if not missao_atual:
         return _error("Missão não encontrada ou sem permissão.", 404)
 
-    body = request.get_json() or {}
+    body, anexo = _ler_corpo_missao()
     try:
         ordem = int(body.get("ordem", 1))
     except (ValueError, TypeError):
@@ -878,17 +1008,25 @@ def editar_missao(current_user, sala_id, missao_id):
     except ValueError as e:
         return _error(str(e), 400)
 
+    # 🔒 Anexo (opcional) substitui o anterior; se nada for enviado, o
+    # campo "anexo_url" não é alterado (missão mantém o anexo existente).
+    dados = {
+        "titulo": body.get("titulo"),
+        "descricao": body.get("descricao"),
+        "ordem": ordem,
+        "xp_reward": int(body.get("xp_reward", 0) or 0),
+        "sticker_recompensa_id": sticker_recompensa_id,
+        "data_limite": data_limite,
+        "periodo_id": periodo_id,
+        "peso_nota": float(body.get("peso_nota", 1) or 1),
+    }
+    if anexo and anexo.filename:
+        anexo_url, erro_anexo = _upload_anexo_geral(db, anexo, "missoes/")
+        if erro_anexo:
+            return _error(erro_anexo, 400)
+        dados["anexo_url"] = anexo_url
+
     try:
-        dados = {
-            "titulo": body.get("titulo"),
-            "descricao": body.get("descricao"),
-            "ordem": ordem,
-            "xp_reward": int(body.get("xp_reward", 0) or 0),
-            "sticker_recompensa_id": sticker_recompensa_id,
-            "data_limite": data_limite,
-            "periodo_id": periodo_id,
-            "peso_nota": float(body.get("peso_nota", 1) or 1),
-        }
         r = db.table("missoes").update(dados).eq("id", missao_id).execute()
         return _success(r.data[0] if r.data else None)
     except Exception as e:
@@ -910,64 +1048,16 @@ def excluir_missao(current_user, sala_id, missao_id):
 
 
 # =============================================================================
-# PROFESSOR — STICKERS (catálogo global, ver nota de segurança na rota POST)
+# STICKERS — SEM CRUD NO BACKEND
+# -----------------------------------------------------------------------------
+# O catálogo de stickers (public.stickers) e as imagens no bucket "stickers"
+# são geridos EXCLUSIVAMENTE pelo Admin via Supabase Dashboard (Table Editor
+# + Storage), usando a service_role key. Esta API não expõe mais nenhuma
+# rota de CRUD para stickers — eles continuam sendo lidos (somente leitura,
+# via RLS `stickers_select`) e vinculados a missões/quizzes como recompensa,
+# conforme já implementado em cadastrar_missao/editar_missao, corrigir_entrega
+# e handle_quiz_completion_rewards.
 # =============================================================================
-@app.route("/api/professor/stickers", methods=["GET"])
-@token_required
-@professor_required
-def listar_stickers(current_user):
-    db = get_user_supabase()
-    return _success(db.table("stickers").select("*").execute().data)
-
-
-@app.route("/api/professor/stickers", methods=["POST"])
-@token_required
-@professor_required
-def cadastrar_sticker(current_user):
-    """
-    Upload de sticker via multipart/form-data.
-
-    NOTA: o catálogo de stickers é GLOBAL (não pertence a uma sala
-    específica) — qualquer professor autenticado pode gerenciá-lo, conforme
-    a policy RLS `is_professor()` em `stickers_insert/update/delete`. Isso é
-    uma decisão de modelagem do banco (fora do escopo deste refactor), não
-    uma falha de posse por-sala. Se o requisito mudar para "sticker por
-    professor", a policy do banco também precisa mudar.
-    """
-    db = get_user_supabase()
-    nome = request.form.get("nome", "").strip()
-    raridade = request.form.get("raridade", "comum")
-    arquivo = request.files.get("imagem_arquivo")
-
-    if not nome or not arquivo:
-        return _error("Nome e arquivo de imagem são obrigatórios.")
-    try:
-        extensao = arquivo.filename.rsplit(".", 1)[-1]
-        nome_arquivo = f"{uuid.uuid4()}.{extensao}"
-        db.storage.from_("stickers").upload(
-            path=nome_arquivo,
-            file=arquivo.read(),
-            file_options={"content-type": arquivo.content_type},
-        )
-        imagem_url = db.storage.from_("stickers").get_public_url(nome_arquivo)
-        r = db.table("stickers").insert({
-            "nome": nome, "imagem_url": imagem_url, "raridade": raridade,
-        }).execute()
-        return _success(r.data[0], 201)
-    except Exception as e:
-        return _error(str(e), 500)
-
-
-@app.route("/api/professor/stickers/<sticker_id>", methods=["DELETE"])
-@token_required
-@professor_required
-def excluir_sticker(current_user, sticker_id):
-    db = get_user_supabase()
-    try:
-        db.table("stickers").delete().eq("id", sticker_id).execute()
-        return _success({"message": "Sticker removido."})
-    except Exception as e:
-        return _error(str(e), 500)
 
 
 # =============================================================================
@@ -1617,41 +1707,6 @@ def gerar_quiz_gemini(current_user):
 
 
 # =============================================================================
-# PERFIL — AVATAR (self-service, qualquer role)
-# =============================================================================
-@app.route("/api/perfil/avatar", methods=["POST"])
-@token_required
-def upload_avatar(current_user):
-    db = get_user_supabase()
-    user_id = current_user["id"]
-    arquivo = request.files.get("avatar")
-    if not arquivo or arquivo.filename == "":
-        return _error("Nenhum arquivo selecionado.")
-
-    extensoes_permitidas = {"jpg", "jpeg", "png", "webp", "gif"}
-    extensao = arquivo.filename.rsplit(".", 1)[-1].lower()
-    if extensao not in extensoes_permitidas:
-        return _error("Formato inválido. Use JPG, PNG, WebP ou GIF.")
-
-    try:
-        nome_arquivo = f"{uuid.uuid4()}.{extensao}"
-        db.storage.from_("avatars").upload(
-            path=nome_arquivo,
-            file=arquivo.read(),
-            file_options={"content-type": arquivo.content_type},
-        )
-        avatar_url = db.storage.from_("avatars").get_public_url(nome_arquivo)
-
-        # 🔒 `perfis_update` (RLS) exige auth.uid() = id — só é possível
-        # alterar o PRÓPRIO perfil; `user_id` aqui é sempre current_user["id"].
-        db.table("perfis").update({"avatar_url": avatar_url}).eq("id", user_id).execute()
-
-        return _success({"avatar_url": avatar_url})
-    except Exception as e:
-        return _error(str(e), 500)
-
-
-# =============================================================================
 # ALUNO — DASHBOARD / TRILHA
 # =============================================================================
 @app.route("/api/aluno/dashboard", methods=["GET"])
@@ -1868,9 +1923,23 @@ def ver_missao_aluno(current_user, missao_id):
 @app.route("/api/aluno/missoes/enviar", methods=["POST"])
 @token_required
 def enviar_missao(current_user):
+    """
+    Envia (ou reenvia) a entrega de uma missão.
+
+    Aceita multipart/form-data: `missao_id` + arquivo opcional em
+    `request.files["anexo"]`. Também aceita JSON puro (sem anexo), para
+    compatibilidade com entregas que não exigem arquivo.
+    """
     db = get_user_supabase()
     aluno_id = current_user["id"]
-    body = request.get_json() or {}
+
+    if request.content_type and "multipart/form-data" in request.content_type:
+        body = request.form
+        anexo = request.files.get("anexo")
+    else:
+        body = request.get_json(silent=True) or {}
+        anexo = None
+
     missao_id = body.get("missao_id")
     if not missao_id:
         return _error("Informe a missão.")
@@ -1885,11 +1954,6 @@ def enviar_missao(current_user):
         if _get_vinculo_aluno(db, aluno_id) != missao["sala_id"]:
             return _error("Acesso negado.", 403)
 
-        atrasado = False
-        dl = _parse_dt(missao.get("data_limite"))
-        if dl and datetime.now(timezone.utc) > dl:
-            atrasado = True
-
         existente = (
             db.table("progresso_missoes")
             .select("id, status")
@@ -1897,21 +1961,37 @@ def enviar_missao(current_user):
             .eq("missao_id", missao_id)
             .execute()
         )
+        if existente.data and existente.data[0]["status"] == "corrigido":
+            return _error("Esta missão já foi corrigida e não pode ser reenviada.", 409)
+
+        # 🔒 Anexo (opcional) vai para o bucket compartilhado "anexos_geral",
+        # sob o prefixo "entregas/", com nome gerado via uuid4().
+        url_entrega = None
+        if anexo and anexo.filename:
+            url_entrega, erro_anexo = _upload_anexo_geral(db, anexo, "entregas/")
+            if erro_anexo:
+                return _error(erro_anexo, 400)
+
+        atrasado = False
+        dl = _parse_dt(missao.get("data_limite"))
+        if dl and datetime.now(timezone.utc) > dl:
+            atrasado = True
+
+        dados_entrega = {
+            "status": "entregue",
+            "entregue_em": datetime.now(timezone.utc).isoformat(),
+        }
+        if url_entrega is not None:
+            dados_entrega["url_entrega"] = url_entrega
 
         if existente.data:
-            if existente.data[0]["status"] == "corrigido":
-                return _error("Esta missão já foi corrigida e não pode ser reenviada.", 409)
-            db.table("progresso_missoes").update({
-                "status": "entregue",
-                "entregue_em": datetime.now(timezone.utc).isoformat(),
-            }).eq("id", existente.data[0]["id"]).execute()
+            db.table("progresso_missoes").update(dados_entrega).eq("id", existente.data[0]["id"]).execute()
         else:
             # 🔒 aluno_id vem sempre de current_user, nunca do body da requisição
             db.table("progresso_missoes").insert({
                 "aluno_id": aluno_id,
                 "missao_id": missao_id,
-                "status": "entregue",
-                "entregue_em": datetime.now(timezone.utc).isoformat(),
+                **dados_entrega,
             }).execute()
 
         return _success({"message": "Missão enviada! Aguarde a correção do professor. 🚀", "atrasado": atrasado})
