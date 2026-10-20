@@ -3,6 +3,7 @@ import json
 import re
 import functools
 import uuid
+import requests
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify, g
@@ -783,9 +784,12 @@ def cadastro():
             )
         return _error(f"Erro ao cadastrar: {str(e)}", 400)
 
-
 @app.route("/api/auth/esqueci-senha", methods=["POST"])
 def esqueci_senha():
+    """
+    Gera o link de recuperação de forma administrativa no Supabase[cite: 1] 
+    e envia o e-mail diretamente pelo back-end através da API REST do EmailJS[cite: 2].
+    """
     body = request.get_json() or {}
     email = _normalizar_email(body.get("email", ""))
 
@@ -797,32 +801,41 @@ def esqueci_senha():
         return _error("Serviço indisponível.", 500)
 
     try:
-        # Gera o link de recuperação de forma administrativa sem disparar o e-mail nativo do Supabase
+        # 1. Gera o link de recuperação seguro no Supabase (sem usar o limite baixo de e-mails nativos)[cite: 1]
         response = supabase_admin.auth.admin.generate_link({
             "type": "recovery",
             "email": email
         })
         
-        # O link gerado pelo Supabase para redefinição de senha
         action_link = response.properties.get("action_link") if response and response.properties else None
         
-        if not action_link:
-            # Por segurança, retornamos sucesso mesmo se o e-mail não existir para evitar enumeração
-            return _success({
-                "message": "Se este e-mail estiver cadastrado, as instruções foram geradas."
-            })
+        # 2. Se o e-mail existir e o link for gerado, dispara o EmailJS a partir do back-end[cite: 1, 2]
+        if action_link:
+            url_emailjs = "https://api.emailjs.com/api/v1.0/email/send"
+            
+            payload = {
+                "service_id": os.getenv("EMAILJS_SERVICE_ID"),
+                "template_id": os.getenv("EMAILJS_TEMPLATE_ID"),
+                "user_id": os.getenv("EMAILJS_PUBLIC_KEY"),
+                "accessToken": os.getenv("EMAILJS_PRIVATE_KEY"), # Chave privada segura no servidor[cite: 2]
+                "template_params": {
+                    "to_email": email,
+                    "reset_link": action_link,  # Nome exato da variável usada no teu template HTML
+                }
+            }
 
-        # Retornamos o link para o front-end disparar o EmailJS, ou você pode tratar aqui.
-        # Nota: Por segurança em produção, idealmente o front-end chama o backend, 
-        # o backend gera o link e o front-end usa o SDK do EmailJS com esse link.
-        return _success({
-            "message": "Link de recuperação gerado com sucesso.",
-            "recovery_link": action_link,
-            "email": email
-        })
+            resp = requests.post(url_emailjs, json=payload)
+            
+            if resp.status_code != 200:
+                print(f"⚠️ Erro ao enviar e-mail via EmailJS: {resp.text}")
 
     except Exception as e:
-        return _error(f"Erro ao processar solicitação: {str(e)}", 400)
+        print(f"⚠️ Erro ao processar recuperação: {str(e)}")
+
+    # 3. Retorno sempre genérico para proteger a plataforma contra enumeração de e-mails
+    return _success({
+        "message": "Se este e-mail estiver cadastrado, as instruções de recuperação foram enviadas."
+    })
 
 
 @app.route("/api/auth/redefinir-senha", methods=["POST"])
