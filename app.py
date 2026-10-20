@@ -739,29 +739,6 @@ def cadastro():
 
         user = auth_response.user
 
-        # 🔒 BUG CORRIGIDO: "cadastro repetido tentando criar perfil com ID
-        # inexistente".
-        #
-        # O GoTrue (Auth do Supabase) NUNCA retorna erro de "e-mail já
-        # cadastrado" em sign_up() — é proteção deliberada contra ataques de
-        # enumeração de e-mail. Em vez disso, ele devolve um objeto de
-        # sucesso "ofuscado" (HTTP 200, com user preenchido), e o único jeito
-        # de distinguir isso de um cadastro novo de verdade é checar
-        # `user.identities`:
-        #
-        #   • E-mail já existe E já está confirmado:
-        #     GoTrue devolve um user FALSO (não existe em auth.users de
-        #     verdade) com `identities == []`. O código antigo tentava
-        #     upsert em perfis com esse id falso → violava a FK
-        #     perfis.id → auth.users(id) → erro confuso de "ID inexistente".
-        #     Agora detectamos isso ANTES de tentar o upsert e retornamos
-        #     uma mensagem clara.
-        #
-        #   • E-mail já existe mas NÃO está confirmado ainda:
-        #     GoTrue devolve o user REAL (identities preenchido), reenvia o
-        #     e-mail de confirmação, e não gera sessão. Tratamos como
-        #     "cadastro já existe, confirme seu e-mail" em vez de reportar
-        #     sucesso de um cadastro novo.
         identidades = user.identities
         email_ja_existe_confirmado = identidades is not None and len(identidades) == 0
 
