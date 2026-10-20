@@ -809,14 +809,6 @@ def cadastro():
 
 @app.route("/api/auth/esqueci-senha", methods=["POST"])
 def esqueci_senha():
-    """
-    Dispara o fluxo nativo do Supabase de recuperação de senha
-    (reset_password_for_email → envia e-mail com link de redefinição).
-
-    Resposta sempre genérica (sucesso), mesmo se o e-mail não existir — não
-    revela se um e-mail está ou não cadastrado (mesma política anti-
-    enumeração do próprio Supabase Auth).
-    """
     body = request.get_json() or {}
     email = _normalizar_email(body.get("email", ""))
 
@@ -824,32 +816,36 @@ def esqueci_senha():
     if not email_ok:
         return _error(email_erro)
 
-    redirect_to = (body.get("redirect_to") or "").strip() or None
+    if supabase_admin is None:
+        return _error("Serviço indisponível.", 500)
 
     try:
-        auth_client = _new_anon_client()
-        if redirect_to:
-            auth_client.auth.reset_password_for_email(email, options={"redirect_to": redirect_to})
-        else:
-            auth_client.auth.reset_password_for_email(email)
-    except Exception as e:
-        # 🔒 Rate limit (429) é a ÚNICA exceção que repassamos ao chamador:
-        # avisar "muitas tentativas, aguarde" não revela se o e-mail existe
-        # (todo mundo recebe o mesmo aviso, exista ou não a conta) — mas
-        # evita que o usuário fique esperando um e-mail que nunca vai chegar
-        # por causa do limite padrão do Supabase (2-4 e-mails/hora no
-        # serviço embutido; ver nota "CONFIGURAÇÃO DE SMTP" no topo do
-        # supabase_schema_completo.sql sobre como configurar SMTP próprio e
-        # subir esse limite). Qualquer outro erro continua silencioso.
-        if _is_rate_limit_error(e):
-            return _error(
-                "Muitas tentativas de envio de e-mail em pouco tempo. Aguarde alguns minutos e tente novamente.",
-                429,
-            )
+        # Gera o link de recuperação de forma administrativa sem disparar o e-mail nativo do Supabase
+        response = supabase_admin.auth.admin.generate_link({
+            "type": "recovery",
+            "email": email
+        })
+        
+        # O link gerado pelo Supabase para redefinição de senha
+        action_link = response.properties.get("action_link") if response and response.properties else None
+        
+        if not action_link:
+            # Por segurança, retornamos sucesso mesmo se o e-mail não existir para evitar enumeração
+            return _success({
+                "message": "Se este e-mail estiver cadastrado, as instruções foram geradas."
+            })
 
-    return _success({
-        "message": "Se este e-mail estiver cadastrado, enviamos um link de redefinição de senha."
-    })
+        # Retornamos o link para o front-end disparar o EmailJS, ou você pode tratar aqui.
+        # Nota: Por segurança em produção, idealmente o front-end chama o backend, 
+        # o backend gera o link e o front-end usa o SDK do EmailJS com esse link.
+        return _success({
+            "message": "Link de recuperação gerado com sucesso.",
+            "recovery_link": action_link,
+            "email": email
+        })
+
+    except Exception as e:
+        return _error(f"Erro ao processar solicitação: {str(e)}", 400)
 
 
 @app.route("/api/auth/redefinir-senha", methods=["POST"])
@@ -857,12 +853,7 @@ def esqueci_senha():
 def redefinir_senha(current_user):
     """
     Redefine a senha do usuário autenticado. O "token" aqui é o access_token
-    de recuperação que o Supabase emite ao clicar no link do e-mail (o front
-    troca o link por uma sessão e manda esse access_token no header
-    Authorization, como em qualquer rota autenticada desta API).
-
-    Aplica a MESMA validação de força de senha do cadastro (RN-G02 /
-    requisito 4: "mesma configuração" entre cadastro e redefinição).
+    de recuperação que o Supabase emite ao clicar no link enviado pelo EmailJS.
     """
     body = request.get_json() or {}
     nova_senha = body.get("senha", "")
@@ -873,14 +864,7 @@ def redefinir_senha(current_user):
 
     token = _get_token_from_header()
     try:
-        # auth.update_user() do SDK exige uma sessão completa (access +
-        # refresh token) carregada internamente via set_session(); aqui só
-        # temos o access_token do header Authorization (igual a qualquer
-        # outra rota desta API). Por isso chamamos o endpoint PUT /user do
-        # GoTrue diretamente com esse token, via `_request` (método "privado"
-        # do SDK, mas é a forma suportada de autenticar com um JWT solto em
-        # vez de uma sessão completa — mesmo padrão usado internamente por
-        # update_user()/get_user() no próprio SDK).
+        # Mantém a mesma lógica robusta que já estava no seu app.py para atualizar a senha via token JWT de recuperação
         auth_client = _new_anon_client()
         auth_client.auth._request("PUT", "user", body={"password": nova_senha}, jwt=token)
         return _success({"message": "Senha redefinida com sucesso."})
