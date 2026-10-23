@@ -787,7 +787,7 @@ def esqueci_senha():
         })
         
         properties =  getattr(response, "properties", None)
-        
+
         if isinstance(properties, dict):
             action_link = properties.get("action_link")
         else:
@@ -806,13 +806,20 @@ def esqueci_senha():
                 "service_id": os.getenv("EMAILJS_SERVICE_ID"),
                 "template_id": os.getenv("EMAILJS_TEMPLATE_ID"),
                 "user_id": os.getenv("EMAILJS_PUBLIC_KEY"),
-                "accessToken": os.getenv("EMAILJS_PRIVATE_KEY"), # Chave privada segura no servidor[cite: 2]
+                "accessToken": os.getenv("EMAILJS_PRIVATE_KEY"),
                 "template_params": {
                     "to_email": email,
-                    "reset_link": action_link,  # Nome exato da variável usada no teu template HTML
+                    "reset_link": action_link,
                 }
             }
 
+            print(f"📦 Payload enviado para o EmailJS: {json.dumps(payload, indent=2)}")
+            resp = requests.post(url_emailjs, json=payload)
+            print(f"📡 Status Code EmailJS: {resp.status_code}")
+            print(f"📄 Resposta EmailJS: {resp.text}")
+            
+            if resp.status_code != 200:
+                print(f"⚠️ Erro ao enviar e-mail via EmailJS: {resp.text}")
             resp = requests.post(url_emailjs, json=payload)
             
             if resp.status_code != 200:
@@ -1056,6 +1063,39 @@ def excluir_sala(current_user, sala_id):
         db.table("salas").delete().eq("id", sala_id).execute()
 
         return _success({"message": "Sala excluída permanentemente."})
+    except Exception as e:
+        return _error(str(e), 500)
+
+
+
+@app.route("/api/professor/salas/<sala_id>/toggle-jogos", methods=["PATCH"])
+@token_required
+@professor_required
+def toggle_jogos_sala(current_user, sala_id):
+    db = get_user_supabase()
+    
+    sala = _sala_do_professor(db, sala_id, current_user["id"])
+    if not sala:
+        return _error("Sala não encontrada ou sem permissão.", 404)
+
+    body = request.get_json() or {}
+    bloqueado = body.get("jogos_bloqueados")
+
+    if not isinstance(bloqueado, bool):
+        return _error("O valor de 'jogos_bloqueados' deve ser booleano (true ou false).", 400)
+
+    try:
+        r = (
+            db.table("salas")
+            .update({"jogos_bloqueados": bloqueado})
+            .eq("id", sala_id)
+            .execute()
+        )
+        status_texto = "bloqueados" if bloqueado else "liberados"
+        return _success({
+            "message": f"Painel de jogos {status_texto} com sucesso!",
+            "jogos_bloqueados": bloqueado
+        })
     except Exception as e:
         return _error(str(e), 500)
 
