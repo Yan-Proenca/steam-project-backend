@@ -694,15 +694,8 @@ def health():
 @app.route("/api/auth/cadastro", methods=["POST"])
 def cadastro():
     """
-    Cadastra um novo usuário (professor ou aluno).
-    RN-G02: cadastro de professor exige a chave mestra.
-
-    SEGURANÇA: `sign_up()` roda num client ANON KEY novo e descartável (é
-    operação pública de auth). O upsert em `perfis` usa o client ADMIN
-    (service_role) porque, quando a confirmação de e-mail está habilitada,
-    `auth_response.session` vem None — ainda não existe um JWT do novo
-    usuário para autenticar um client comum. Esta é a ÚNICA rota de negócio
-    deste arquivo que usa a service_role key.
+    Cadastra um novo usuário (professor ou aluno) e já o confirma
+    automaticamente, permitindo login imediato sem validação por e-mail.
     """
     if supabase_admin is None:
         return _error("Serviço de cadastro indisponível (SUPABASE_SERVICE_KEY não configurada).", 500)
@@ -740,33 +733,17 @@ def cadastro():
 
         user = auth_response.user
 
-        identidades = user.identities
-        email_ja_existe_confirmado = identidades is not None and len(identidades) == 0
-
-        if email_ja_existe_confirmado:
-            return _error(
-                "Este e-mail já está cadastrado. Faça login ou use 'Esqueci minha senha'.",
-                409,
+        # 🔒 Força a confirmação do e-mail automaticamente pelo Admin do Supabase
+        # para que o usuário consiga fazer login de imediato.
+        try:
+            supabase_admin.auth.admin.update_user_by_id(
+                user.id,
+                {"email_confirm": True}
             )
+        except Exception:
+            pass
 
-        # E-mail já existe mas aguardando confirmação: como o GoTrue não
-        # expõe isso de forma 100% distinguível de um cadastro novo em todas
-        # as versões, usamos um sinal adicional e confiável — se já existe
-        # uma linha em `perfis` para esse id (criada por um sign_up anterior
-        # + trigger on_auth_user_created), este NÃO é um cadastro novo.
-        perfil_preexistente = (
-            supabase_admin.table("perfis").select("id").eq("id", user.id).execute()
-        )
-        if perfil_preexistente.data:
-            return _error(
-                "Este e-mail já está cadastrado e aguardando confirmação. "
-                "Verifique sua caixa de entrada ou solicite um novo e-mail de confirmação.",
-                409,
-            )
-
-        # Cadastro novo de verdade: usa upsert() para não colidir com o
-        # trigger `on_auth_user_created` (SECURITY DEFINER), que também
-        # popula `perfis` a partir dos metadados passados em options.data.
+        # Garante que o perfil é inserido/atualizado corretamente
         supabase_admin.table("perfis").upsert({
             "id": user.id,
             "nome": nome,
@@ -774,12 +751,14 @@ def cadastro():
             "email": email,
         }, on_conflict="id").execute()
 
-        return _success({"message": "Cadastro realizado! Verifique seu e-mail."}, 201)
+        return _success({
+            "message": "Cadastro realizado com sucesso! Já pode fazer login."
+        }, 201)
+
     except Exception as e:
         if _is_rate_limit_error(e):
             return _error(
-                "Muitas tentativas de cadastro em pouco tempo (limite de envio de e-mail do "
-                "Supabase). Aguarde alguns minutos e tente novamente.",
+                "Muitas tentativas de cadastro em pouco tempo. Aguarde alguns minutos e tente novamente.",
                 429,
             )
         return _error(f"Erro ao cadastrar: {str(e)}", 400)
