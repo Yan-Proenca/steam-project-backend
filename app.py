@@ -786,7 +786,17 @@ def esqueci_senha():
             "email": email
         })
         
-        action_link = response.properties.get("action_link") if response and response.properties else None
+        properties =  getattr(response, "properties", None)
+        
+        if isinstance(properties, dict):
+            action_link = properties.get("action_link")
+        else:
+            action_link = getattr(properties, "action_link", None)
+
+        if not action_link:
+            raise RuntimeError(
+                "Supabase não retorno o link de recuperação"
+            )
         
         # 2. Se o e-mail existir e o link for gerado, dispara o EmailJS a partir do back-end[cite: 1, 2]
         if action_link:
