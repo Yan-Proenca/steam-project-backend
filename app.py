@@ -2557,11 +2557,11 @@ def dashboard_aluno(current_user):
         return _success({"tem_sala": False})
 
     sala_r = (
-        db.table("salas")
-        .select("id, nome, codigo_acesso, perfis!salas_professor_id_fkey(nome)")
-        .eq("id", sala_id)
-        .execute()
-    )
+            db.table("salas")
+            .select("id, nome, codigo_acesso, jogos_bloqueados, perfis!salas_professor_id_fkey(nome)")
+            .eq("id", sala_id)
+            .execute()
+        )
     sala = sala_r.data[0] if sala_r.data else None
 
     periodos_sala = db.table("periodos").select("id, nome").eq("sala_id", sala_id).order("criado_em").execute().data
