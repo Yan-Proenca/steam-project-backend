@@ -1741,6 +1741,14 @@ def criar_tarefa_equipe(current_user, equipe_id):
             "status": status,
             "criado_por": aluno_id,
         }).execute()
+        # 🔔 Só notifica se houver responsável definido e ele não for quem criou a tarefa.
+        if responsavel_id and responsavel_id != aluno_id:
+            _criar_notificacao(
+                db, responsavel_id,
+                "Nova tarefa atribuída a você",
+                f"{current_user['nome']} atribuiu a tarefa \"{titulo}\" a você.",
+                link=f"/equipes/{equipe_id}/tarefas",
+            )
         return _success(r.data[0], 201)
     except Exception as e:
         return _error(str(e), 500)
@@ -2063,6 +2071,32 @@ def _conceder_sticker_se_houver(db, aluno_id: str, sticker_id):
         db.table("aluno_stickers").insert({"aluno_id": aluno_id, "sticker_id": sticker_id}).execute()
 
 
+def _criar_notificacao(db, usuario_id: str, titulo: str, mensagem: str, link: str = None):
+    """
+    Cria uma notificação para `usuario_id`. Chamada por rotas que disparam
+    eventos de negócio (correção de entrega, novo material pendente, nova
+    tarefa de equipe, etc) — NUNCA deve derrubar o fluxo principal da rota
+    que a chamou, então qualquer exceção é apenas logada (print), nunca
+    propagada. Por isso é sempre a ÚLTIMA coisa feita antes do `return
+    _success(...)` da rota.
+
+    `usuario_id` nunca deve vir de um campo livre do body — sempre de um
+    registro já validado (ex: aluno_id de uma entrega, professor_id de uma
+    sala, responsavel_id já confirmado como membro de uma equipe).
+    """
+    if not usuario_id:
+        return
+    try:
+        db.table("notificacoes").insert({
+            "usuario_id": usuario_id,
+            "titulo": titulo,
+            "mensagem": mensagem,
+            "link": link,
+        }).execute()
+    except Exception as e:
+        print(f"⚠️  Falha ao criar notificação (usuario_id={usuario_id}): {e}")
+
+
 @app.route("/api/professor/entregas/<progresso_id>/corrigir", methods=["POST"])
 @token_required
 @professor_required
@@ -2117,6 +2151,13 @@ def corrigir_entrega(current_user, progresso_id):
                 return _error("Não foi possível corrigir esta entrega.", 403)
             for linha in upd.data:
                 _conceder_sticker_se_houver(db, linha["aluno_id"], sticker_id)
+                # 🔔 Um por membro da equipe — mesma nota, mesma mensagem.
+                _criar_notificacao(
+                    db, linha["aluno_id"],
+                    "Sua missão foi corrigida!",
+                    f"\"{progresso['missoes']['titulo']}\" recebeu nota {nota:.1f}.",
+                    link=f"/missoes/{progresso['missao_id']}",
+                )
             return _success({
                 "message": f"Entrega corrigida! Nota lançada para os {len(upd.data)} membros da equipe.",
                 "membros_afetados": len(upd.data),
@@ -2135,6 +2176,13 @@ def corrigir_entrega(current_user, progresso_id):
             return _error("Não foi possível corrigir esta entrega.", 403)
 
         _conceder_sticker_se_houver(db, progresso["aluno_id"], sticker_id)
+        # 🔔 Notifica o aluno dono da entrega.
+        _criar_notificacao(
+            db, progresso["aluno_id"],
+            "Sua missão foi corrigida!",
+            f"\"{progresso['missoes']['titulo']}\" recebeu nota {nota:.1f}.",
+            link=f"/missoes/{progresso['missao_id']}",
+        )
         return _success({"message": "Entrega corrigida e nota lançada!"})
     except Exception as e:
         return _error(str(e), 500)
@@ -2726,6 +2774,13 @@ def propor_material_aluno(current_user):
             "criado_por": aluno_id,
             "criado_por_role": "aluno",
         }).execute()
+        # 🔔 Notifica o professor da sala: há um material novo aguardando aprovação.
+        _criar_notificacao(
+            db, professor_id,
+            "Novo material pendente de aprovação",
+            f"{current_user['nome']} propôs o material \"{titulo}\" para a biblioteca.",
+            link=f"/professor/biblioteca?material_id={r.data[0]['id']}",
+        )
         return _success({
             "material": r.data[0],
             "message": "Material enviado para aprovação do professor.",
@@ -3096,6 +3151,49 @@ def responder_quiz(current_user, quiz_id):
             "correct_answers": correct_answers,
             "total_questions": total_questions,
         })
+    except Exception as e:
+        return _error(str(e), 500)
+
+
+# =============================================================================
+# NOTIFICAÇÕES
+# =============================================================================
+@app.route("/api/notificacoes", methods=["GET"])
+@token_required
+def listar_notificacoes(current_user):
+    db = get_user_supabase()
+    try:
+        notificacoes = (
+            db.table("notificacoes")
+            .select("*")
+            .eq("usuario_id", current_user["id"])
+            .order("criado_em", desc=True)
+            .limit(30)
+            .execute().data
+        )
+        return _success({"notificacoes": notificacoes})
+    except Exception as e:
+        return _error(str(e), 500)
+
+
+@app.route("/api/notificacoes/<notificacao_id>/ler", methods=["PATCH"])
+@token_required
+def marcar_notificacao_lida(current_user, notificacao_id):
+    db = get_user_supabase()
+    try:
+        # 🔒 .eq("usuario_id", ...) além do RLS — reforço pós-escrita: se 0
+        # linhas foram afetadas, a notificação não existe ou não é do
+        # current_user, e devolvemos 404 em vez de sucesso vazio.
+        upd = (
+            db.table("notificacoes")
+            .update({"lida": True})
+            .eq("id", notificacao_id)
+            .eq("usuario_id", current_user["id"])
+            .execute()
+        )
+        if not upd.data:
+            return _error("Notificação não encontrada.", 404)
+        return _success(upd.data[0])
     except Exception as e:
         return _error(str(e), 500)
 
