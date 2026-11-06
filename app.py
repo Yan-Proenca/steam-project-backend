@@ -2072,19 +2072,22 @@ def _conceder_sticker_se_houver(db, aluno_id: str, sticker_id):
 
 
 def _criar_notificacao(db, usuario_id: str, titulo: str, mensagem: str, link: str = None):
+    """
+    Cria uma notificação para `usuario_id` utilizando o client administrativo (service role)
+    para evitar erros de Row Level Security (RLS) quando o sistema gera notificações entre usuários.
+    """
     if not usuario_id:
         return
     try:
-        db.table("notificacoes").insert({
-            "usuario_id": usuario_id,
-            "titulo": titulo,
-            "mensagem": mensagem,
-            "link": link,
-        }).execute()
+        if supabase_admin:
+            supabase_admin.table("notificacoes").insert({
+                "usuario_id": usuario_id,
+                "titulo": titulo,
+                "mensagem": mensagem,
+                "link": link,
+            }).execute()
     except Exception as e:
-        # Mudei para imprimir o erro detalhado no terminal
-        print(f"❌ ERRO CRÍTICO AO CRIAR NOTIFICAÇÃO (usuario_id={usuario_id}): {e}")
-        raise e # Opcional: se quiser ver o erro quebrando a requisição de teste
+        print(f"⚠️  Falha ao criar notificação (usuario_id={usuario_id}): {e}")
 
 @app.route("/api/professor/entregas/<progresso_id>/corrigir", methods=["POST"])
 @token_required
