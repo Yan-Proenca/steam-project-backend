@@ -2541,7 +2541,6 @@ def excluir_material(current_user, sala_id, material_id):
     except Exception as e:
         return _error(str(e), 500)
 
-
 # =============================================================================
 # PROFESSOR — GERAÇÃO DE QUIZ COM GEMINI (não acessa dados de sala/aluno)
 # =============================================================================
@@ -3182,6 +3181,210 @@ def marcar_notificacao_lida(current_user, notificacao_id):
         if not upd.data:
             return _error("Notificação não encontrada.", 404)
         return _success(upd.data[0])
+    except Exception as e:
+        return _error(str(e), 500)
+
+
+
+@app.route("/api/aluno/missoes/<missao_id>/perguntas", methods=["POST"])
+@token_required
+def enviar_pergunta_missao(current_user, missao_id):
+    db = get_user_supabase()
+    aluno_id = current_user["id"]
+
+    body = request.get_json() or {}
+    texto = (body.get("texto") or "").strip()
+
+    if not texto:
+        return _error("O texto da pergunta não pode estar vazio.", 400)
+
+    try:
+        # 1. Valida se a missão existe e pega o sala_id dela
+        missao_r = (
+            db.table("missoes")
+            .select("id, sala_id, titulo")
+            .eq("id", missao_id)
+            .execute()
+        )
+        if not missao_r.data:
+            return _error("Missão não encontrada.", 404)
+        missao = missao_r.data[0]
+
+        # 2. Confirma se o aluno está matriculado na sala da missão (Camada 2)
+        if _get_vinculo_aluno(db, aluno_id) != missao["sala_id"]:
+            return _error("Acesso negado.", 403)
+
+        # 3. Insere a pergunta no banco
+        r = db.table("missao_perguntas").insert({
+            "missao_id": missao_id,
+            "aluno_id": aluno_id,
+            "texto": texto,
+            "status": "pendente"
+        }).execute()
+
+        # 4. Opcional: Buscar o professor da sala para notificá-lo
+        sala_r = db.table("salas").select("professor_id").eq("id", missao["sala_id"]).execute()
+        if sala_r.data:
+            professor_id = sala_r.data[0]["professor_id"]
+            _criar_notificacao(
+                db, professor_id,
+                "Nova dúvida em missão",
+                f"{current_user['nome']} enviou uma dúvida na missão \"{missao['titulo']}\".",
+                link=f"/professor/missoes/{missao_id}/perguntas"
+            )
+
+        return _success(r.data[0], 201)
+
+    except Exception as e:
+        return _error(str(e), 500)
+
+# =============================================================================
+# PROFESSOR — PERGUNTAS / DÚVIDAS DOS ALUNOS
+# =============================================================================
+
+@app.route("/api/professor/salas/<sala_id>/perguntas", methods=["GET"])
+@token_required
+@professor_required
+def listar_perguntas_sala(current_user, sala_id):
+    """
+    Lista as perguntas dos alunos enviadas para a sala informada.
+    Suporta filtro por status ('pendente', 'respondida') e/ou por missao_id.
+    """
+    db = get_user_supabase()
+    if not _sala_do_professor(db, sala_id, current_user["id"]):
+        return _error("Sala não encontrada ou sem permissão.", 404)
+
+    status_filtro = request.args.get("status", "").strip().lower()
+    missao_filtro = request.args.get("missao_id", "").strip()
+
+    # Buscar todas as missões da sala para validação e mapeamento
+    missoes_r = (
+        db.table("missoes")
+        .select("id, titulo, ordem")
+        .eq("sala_id", sala_id)
+        .order("ordem")
+        .execute()
+        .data
+    )
+    if not missoes_r:
+        return _success({"perguntas": [], "missoes": []})
+
+    missao_ids = [m["id"] for m in missoes_r]
+    missoes_map = {m["id"]: m["titulo"] for m in missoes_r}
+
+    # Query principal de perguntas
+    q = (
+        db.table("missao_perguntas")
+        .select("*, perfis(id, nome, email)")
+        .in_("missao_id", missao_ids)
+        .order("criado_em", desc=True)
+    )
+
+    if status_filtro in ("pendente", "respondida"):
+        q = q.eq("status", status_filtro)
+
+    if missao_filtro and missao_filtro in missao_ids:
+        q = q.eq("missao_id", missao_filtro)
+
+    perguntas_raw = q.execute().data or []
+
+    # Formatar dados de saída
+    perguntas = []
+    for p in perguntas_raw:
+        aluno_perfil = p.get("perfis") or {}
+        perguntas.append({
+            "id": p["id"],
+            "missao_id": p["missao_id"],
+            "titulo_missao": missoes_map.get(p["missao_id"], "—"),
+            "aluno_id": p["aluno_id"],
+            "aluno_nome": aluno_perfil.get("nome", "Aluno desconhecido"),
+            "aluno_email": aluno_perfil.get("email", ""),
+            "texto": p["texto"],
+            "resposta": p.get("resposta"),
+            "status": p.get("status", "pendente"),
+            "criado_em": p.get("criado_em"),
+            "respondido_em": p.get("respondido_em"),
+        })
+
+    return _success({
+        "perguntas": perguntas,
+        "missoes": missoes_r,
+        "resumo": {
+            "total": len(perguntas),
+            "pendentes": sum(1 for p in perguntas if p["status"] == "pendente"),
+            "respondidas": sum(1 for p in perguntas if p["status"] == "respondida"),
+        }
+    })
+
+
+@app.route("/api/professor/perguntas/<pergunta_id>/responder", methods=["PATCH"])
+@token_required
+@professor_required
+def responder_pergunta(current_user, pergunta_id):
+    """
+    Permite ao professor responder ou editar a resposta a uma dúvida enviada por um aluno.
+    Atualiza o texto da resposta, muda o status para 'respondida' e notifica o aluno.
+    """
+    db = get_user_supabase()
+    professor_id = current_user["id"]
+
+    body = request.get_json() or {}
+    resposta_texto = (body.get("resposta") or "").strip()
+
+    if not resposta_texto:
+        return _error("O texto da resposta não pode estar vazio.", 400)
+
+    try:
+        # 1. Buscar a pergunta com dados da missão associada
+        pergunta_r = (
+            db.table("missao_perguntas")
+            .select("*, missoes(id, titulo, sala_id)")
+            .eq("id", pergunta_id)
+            .execute()
+        )
+        if not pergunta_r.data:
+            return _error("Pergunta não encontrada.", 404)
+
+        pergunta = pergunta_r.data[0]
+        missao = pergunta.get("missoes") or {}
+        sala_id = missao.get("sala_id")
+
+        # 2. Camada 2: Verificar se a sala pertence ao professor autenticado
+        if not sala_id or not _sala_do_professor(db, sala_id, professor_id):
+            return _error("Você não tem permissão para responder a esta pergunta.", 403)
+
+        # 3. Atualizar a pergunta no banco
+        agora = datetime.now(timezone.utc).isoformat()
+        upd = (
+            db.table("missao_perguntas")
+            .update({
+                "resposta": resposta_texto,
+                "status": "respondida",
+                "respondido_em": agora,
+            })
+            .eq("id", pergunta_id)
+            .execute()
+        )
+
+        if not upd.data:
+            return _error("Não foi possível atualizar a pergunta.", 500)
+
+        pergunta_atualizada = upd.data[0]
+
+        # 4. Notificar o aluno que a pergunta dele foi respondida
+        _criar_notificacao(
+            db,
+            pergunta["aluno_id"],
+            "Sua dúvida foi respondida!",
+            f"O professor respondeu à sua pergunta na missão \"{missao.get('titulo', '')}\".",
+            link=f"/aluno/missoes/{pergunta['missao_id']}"
+        )
+
+        return _success({
+            "message": "Resposta enviada com sucesso!",
+            "pergunta": pergunta_atualizada,
+        })
+
     except Exception as e:
         return _error(str(e), 500)
 
