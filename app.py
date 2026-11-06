@@ -3437,5 +3437,63 @@ def listar_perguntas_aluno_missao(current_user, missao_id):
         return _error(str(e), 500)
 
 
+# Lista de avatares válidos permitidos pelo sistema
+_AVATARES_PERMITIDOS = {
+    "lilas-astronauta",
+    "verde-cientista",
+    "azul-artista",
+    "turquesa-leitor",
+    "lilas-engenheiro",
+    "verde-astronauta",
+    "azul-explorador",
+    "turquesa-astronauta"
+}
+
+@app.route("/api/perfil/avatar", methods=["PATCH"])
+@token_required
+def atualizar_avatar(current_user):
+    """
+    Atualiza o avatar_id do usuário autenticado após validar contra a lista permitida.
+    """
+    db = get_user_supabase()
+    body = request.get_json() or {}
+    avatar_id = (body.get("avatar_id") or "").strip()
+
+    if not avatar_id or avatar_id not in _AVATARES_PERMITIDOS:
+        permitidos_str = ", ".join(sorted(_AVATARES_PERMITIDOS))
+        return _error(f"Avatar inválido. Escolha um dos seguintes: {permitidos_str}.", 400)
+
+    try:
+        # Usa estritamente o ID do usuário autenticado (current_user), ignorando qualquer input externo
+        upd = (
+            db.table("perfis")
+            .update({"avatar_id": avatar_id})
+            .eq("id", current_user["id"])
+            .execute()
+        )
+
+        if not upd.data:
+            return _error("Não foi possível atualizar o avatar.", 403)
+
+        return _success({
+            "avatar_id": avatar_id
+        })
+    except Exception as e:
+        return _error(str(e), 500)
+
+@app.route("/api/perfil", methods=["GET"])
+@token_required
+def ver_perfil(current_user):
+    db = get_user_supabase()
+    r = (
+        db.table("perfis")
+        .select("id, nome, email, role, xp, avatar_id") # <-- Adicionado avatar_id aqui
+        .eq("id", current_user["id"])
+        .execute()
+    )
+    if not r.data:
+        return _error("Perfil não encontrado.", 404)
+    return _success(r.data[0])
+
 if __name__ == "__main__":
     app.run(debug=True)
