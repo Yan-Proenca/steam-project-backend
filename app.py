@@ -2072,18 +2072,6 @@ def _conceder_sticker_se_houver(db, aluno_id: str, sticker_id):
 
 
 def _criar_notificacao(db, usuario_id: str, titulo: str, mensagem: str, link: str = None):
-    """
-    Cria uma notificação para `usuario_id`. Chamada por rotas que disparam
-    eventos de negócio (correção de entrega, novo material pendente, nova
-    tarefa de equipe, etc) — NUNCA deve derrubar o fluxo principal da rota
-    que a chamou, então qualquer exceção é apenas logada (print), nunca
-    propagada. Por isso é sempre a ÚLTIMA coisa feita antes do `return
-    _success(...)` da rota.
-
-    `usuario_id` nunca deve vir de um campo livre do body — sempre de um
-    registro já validado (ex: aluno_id de uma entrega, professor_id de uma
-    sala, responsavel_id já confirmado como membro de uma equipe).
-    """
     if not usuario_id:
         return
     try:
@@ -2094,8 +2082,9 @@ def _criar_notificacao(db, usuario_id: str, titulo: str, mensagem: str, link: st
             "link": link,
         }).execute()
     except Exception as e:
-        print(f"⚠️  Falha ao criar notificação (usuario_id={usuario_id}): {e}")
-
+        # Mudei para imprimir o erro detalhado no terminal
+        print(f"❌ ERRO CRÍTICO AO CRIAR NOTIFICAÇÃO (usuario_id={usuario_id}): {e}")
+        raise e # Opcional: se quiser ver o erro quebrando a requisição de teste
 
 @app.route("/api/professor/entregas/<progresso_id>/corrigir", methods=["POST"])
 @token_required
