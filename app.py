@@ -2369,18 +2369,12 @@ def desempenho_consolidado(current_user, sala_id):
 
 
 # =============================================================================
-# PROFESSOR — BIBLIOTECA DE MATERIAIS
+# PROFESSOR — BIBLIOTECA DE MATERIAIS (COM SUPORTE A ARQUIVAR)
 # =============================================================================
 _BIBLIO_EXTENSOES_PERMITIDAS = {"pdf", "png", "jpg", "jpeg", "webp"}
 
 
 def _ler_corpo_material():
-    """
-    Mesma lógica de _ler_corpo_missao: aceita JSON (sem anexo) ou
-    multipart/form-data (com anexo opcional no campo "anexo"). `links`, em
-    multipart, chega como string JSON (já que form-data não tem tipos
-    aninhados) e precisa ser decodificado manualmente.
-    """
     if request.content_type and "multipart/form-data" in request.content_type:
         body = request.form
         anexo = request.files.get("anexo")
@@ -2395,12 +2389,6 @@ def _ler_corpo_material():
 
 
 def _upload_anexo_biblioteca(db, arquivo):
-    """
-    Upload de PDF/imagem para a biblioteca, no bucket compartilhado
-    "anexos_geral", prefixo "biblioteca/". Reaproveita a validação de
-    tamanho (20 MB) de _upload_anexo_geral, mas restringe as extensões
-    aceitas a PDF/imagem (um material de biblioteca não é um .zip ou .py).
-    """
     if not arquivo or not arquivo.filename:
         return None, None, "Nenhum arquivo selecionado."
     extensao = arquivo.filename.rsplit(".", 1)[-1].lower() if "." in arquivo.filename else ""
@@ -2429,12 +2417,18 @@ def biblioteca_professor(current_user, sala_id):
         .eq("sala_id", sala_id)
         .order("criado_em", desc=True)
     )
+    
     missao_filtro = request.args.get("missao_id", "")
     if missao_filtro:
         q = q.eq("missao_id", missao_filtro)
+        
     status_filtro = request.args.get("status", "")
     if status_filtro:
         q = q.eq("status", status_filtro)
+    else:
+        # Opcional: Se não passar filtro de status, você pode querer esconder os arquivados por padrão:
+        q = q.neq("status", "arquivado")
+
     materiais = q.execute().data
 
     return _success({
@@ -2448,7 +2442,6 @@ def biblioteca_professor(current_user, sala_id):
 @token_required
 @professor_required
 def criar_material(current_user, sala_id):
-    """Professor cria material já aprovado. Aceita anexo (PDF/imagem) opcional."""
     db = get_user_supabase()
     if not _sala_do_professor(db, sala_id, current_user["id"]):
         return _error("Sala não encontrada ou sem permissão.", 404)
@@ -2491,12 +2484,6 @@ def criar_material(current_user, sala_id):
 @token_required
 @professor_required
 def editar_material(current_user, sala_id, material_id):
-    """
-    Professor edita o material — inclusive uma proposta de aluno pendente,
-    o que já serve como "aprovar com ajustes": basta mandar status='aprovado'
-    no corpo (ou deixar status de fora para só trocar o conteúdo sem mudar
-    o status atual).
-    """
     db = get_user_supabase()
     material_atual = _material_da_sala(db, material_id, sala_id, current_user["id"])
     if not material_atual:
@@ -2511,9 +2498,10 @@ def editar_material(current_user, sala_id, material_id):
     if missao_id and not _missao_da_sala(db, missao_id, sala_id, current_user["id"]):
         return _error("Missão inválida para esta sala.", 404)
 
+    # Adicionado "arquivado" nas opções válidas de status
     status_novo = (body.get("status") or material_atual.get("status") or "aprovado").strip().lower()
-    if status_novo not in ("pendente", "aprovado"):
-        return _error("Status inválido. Use 'pendente' ou 'aprovado'.", 400)
+    if status_novo not in ("pendente", "aprovado", "arquivado"):
+        return _error("Status inválido. Use 'pendente', 'aprovado' ou 'arquivado'.", 400)
 
     dados = {
         "titulo": titulo,
