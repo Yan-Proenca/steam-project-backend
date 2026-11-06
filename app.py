@@ -3189,6 +3189,9 @@ def marcar_notificacao_lida(current_user, notificacao_id):
 @app.route("/api/aluno/missoes/<missao_id>/perguntas", methods=["POST"])
 @token_required
 def enviar_pergunta_missao(current_user, missao_id):
+    """
+    Permite ao aluno enviar uma dúvida sobre uma missão específica.
+    """
     db = get_user_supabase()
     aluno_id = current_user["id"]
 
@@ -3222,7 +3225,7 @@ def enviar_pergunta_missao(current_user, missao_id):
             "status": "pendente"
         }).execute()
 
-        # 4. Opcional: Buscar o professor da sala para notificá-lo
+        # 4. Notifica o professor da sala
         sala_r = db.table("salas").select("professor_id").eq("id", missao["sala_id"]).execute()
         if sala_r.data:
             professor_id = sala_r.data[0]["professor_id"]
@@ -3230,7 +3233,7 @@ def enviar_pergunta_missao(current_user, missao_id):
                 db, professor_id,
                 "Nova dúvida em missão",
                 f"{current_user['nome']} enviou uma dúvida na missão \"{missao['titulo']}\".",
-                link=f"/professor/missoes/{missao_id}/perguntas"
+                link=f"/professor/salas/{missao['sala_id']}/perguntas"
             )
 
         return _success(r.data[0], 201)
@@ -3383,6 +3386,59 @@ def responder_pergunta(current_user, pergunta_id):
         return _success({
             "message": "Resposta enviada com sucesso!",
             "pergunta": pergunta_atualizada,
+        })
+
+    except Exception as e:
+        return _error(str(e), 500)
+
+# =============================================================================
+# ALUNO — ENVIAR DÚVIDA SOBRE UMA MISSÃO
+# =============================================================================
+
+@app.route("/api/aluno/missoes/<missao_id>/perguntas", methods=["GET"])
+@token_required
+def listar_perguntas_aluno_missao(current_user, missao_id):
+    """
+    Lista as perguntas enviadas pelo próprio aluno para uma missão específica
+    (ou de toda a turma/sala, dependendo do contexto da interface),
+    incluindo o status e a resposta do professor, se houver.
+    """
+    db = get_user_supabase()
+    aluno_id = current_user["id"]
+
+    try:
+        # 1. Verificar se a missão existe e obter a sala correspondente
+        missao_r = (
+            db.table("missoes")
+            .select("id, sala_id, titulo")
+            .eq("id", missao_id)
+            .execute()
+        )
+        if not missao_r.data:
+            return _error("Missão não encontrada.", 404)
+        
+        missao = missao_r.data[0]
+
+        # 2. Confirmar se o aluno pertence à sala da missão
+        if _get_vinculo_aluno(db, aluno_id) != missao["sala_id"]:
+            return _error("Acesso negado.", 403)
+
+        # 3. Procurar as perguntas do aluno para esta missão
+        # Nota: O RLS ("perguntas_select") garante que o aluno apenas lê o que lhe é permitido
+        perguntas = (
+            db.table("missao_perguntas")
+            .select("id, texto, resposta, status, criado_em, respondido_em")
+            .eq("missao_id", missao_id)
+            .eq("aluno_id", aluno_id)
+            .order("criado_em", desc=True)
+            .execute()
+            .data
+        )
+
+        return _success({
+            "missao_id": missao_id,
+            "titulo_missao": missao["titulo"],
+            "perguntas": perguntas or []
         })
 
     except Exception as e:
