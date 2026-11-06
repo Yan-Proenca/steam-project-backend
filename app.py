@@ -3437,7 +3437,6 @@ def listar_perguntas_aluno_missao(current_user, missao_id):
         return _error(str(e), 500)
 
 
-# Lista de avatares válidos permitidos pelo sistema
 _AVATARES_PERMITIDOS = {
     "lilas-astronauta",
     "verde-cientista",
