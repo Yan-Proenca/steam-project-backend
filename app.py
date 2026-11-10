@@ -2296,6 +2296,414 @@ def pauta(current_user, sala_id):
     })
 
 
+# =============================================================================
+# PROFESSOR — EDITAR QUESTIONÁRIO
+# =============================================================================
+
+@app.route(
+    "/api/professor/salas/<sala_id>/quizzes/<quiz_id>",
+    methods=["PATCH"]
+)
+@token_required
+@professor_required
+def editar_quiz(current_user, sala_id, quiz_id):
+
+    db = get_user_supabase()
+    professor_id = current_user["id"]
+
+    # 1. Validar UUIDs
+    if not _uuid_valido(sala_id) or not _uuid_valido(quiz_id):
+        return _error("ID da sala ou do questionário inválido.", 400)
+
+    # 2. Verificar propriedade da sala
+    if not _sala_do_professor(db, sala_id, professor_id):
+        return _error("Sala não encontrada ou sem permissão.", 404)
+
+    body = request.get_json(silent=True)
+
+    if not isinstance(body, dict):
+        return _error("Envie os dados em formato JSON.", 400)
+
+    campos_permitidos = {
+        "titulo",
+        "descricao",
+        "dificuldade",
+        "xp_reward",
+        "sticker_reward_id",
+        "periodo_id",
+        "missao_id",
+        "perguntas"
+    }
+
+    campos_desconhecidos = set(body.keys()) - campos_permitidos
+
+    if campos_desconhecidos:
+        return _error(
+            f"Campos não permitidos: {', '.join(sorted(campos_desconhecidos))}.",
+            400
+        )
+
+    if not body:
+        return _error("Informe pelo menos um campo para atualizar.", 400)
+
+    # 3. Localizar o questionário dentro da sala informada
+    quiz_r = (
+        db.table("quiz")
+        .select("*")
+        .eq("id", quiz_id)
+        .eq("sala_id", sala_id)
+        .execute()
+    )
+
+    if not quiz_r.data:
+        return _error("Questionário não encontrado nesta sala.", 404)
+
+    quiz_atual = quiz_r.data[0]
+
+    # 4. Preservar o histórico: não editar questionários já respondidos
+    tentativas = (
+        db.table("quiz_progress")
+        .select("id")
+        .eq("quiz_id", quiz_id)
+        .limit(1)
+        .execute()
+        .data
+    )
+
+    if tentativas:
+        return _error(
+            "Este questionário já possui respostas registradas e não pode ser editado.",
+            409
+        )
+
+    # 5. Validar os campos enviados
+    dados_atualizacao = {}
+
+    if "titulo" in body:
+        titulo = body["titulo"]
+
+        if not isinstance(titulo, str) or not titulo.strip():
+            return _error("O título do questionário é obrigatório.", 400)
+
+        dados_atualizacao["titulo"] = titulo.strip()
+
+    if "descricao" in body:
+        descricao = body["descricao"]
+
+        if descricao is not None and not isinstance(descricao, str):
+            return _error("A descrição precisa ser um texto.", 400)
+
+        dados_atualizacao["descricao"] = (
+            descricao.strip() or None
+            if descricao is not None
+            else None
+        )
+
+    if "dificuldade" in body:
+        dificuldade = body["dificuldade"]
+
+        dificuldades_validas = {"facil", "medio", "dificil"}
+
+        if not isinstance(dificuldade, str):
+            return _error("Dificuldade inválida.", 400)
+
+        dificuldade = dificuldade.strip().lower()
+
+        if dificuldade not in dificuldades_validas:
+            return _error(
+                "Utilize uma dificuldade válida: facil, medio ou dificil.",
+                400
+            )
+
+        dados_atualizacao["dificuldade"] = dificuldade
+
+    if "xp_reward" in body:
+        xp_raw = body["xp_reward"]
+
+        if isinstance(xp_raw, bool):
+            return _error("A recompensa de XP precisa ser um inteiro.", 400)
+
+        try:
+            xp_reward = int(xp_raw)
+        except (ValueError, TypeError):
+            return _error("A recompensa de XP precisa ser um inteiro.", 400)
+
+        if isinstance(xp_raw, float) and not xp_raw.is_integer():
+            return _error("A recompensa de XP não pode ter casas decimais.", 400)
+
+        if xp_reward < 0:
+            return _error("A recompensa de XP não pode ser negativa.", 400)
+
+        dados_atualizacao["xp_reward"] = xp_reward
+
+    # 6. Validar sticker opcional
+    if "sticker_reward_id" in body:
+        sticker_id = body["sticker_reward_id"] or None
+
+        if not _uuid_valido(sticker_id):
+            return _error("ID do sticker inválido.", 400)
+
+        if sticker_id:
+            sticker_r = (
+                db.table("stickers")
+                .select("id")
+                .eq("id", sticker_id)
+                .execute()
+            )
+
+            if not sticker_r.data:
+                return _error("Sticker de recompensa não encontrado.", 404)
+
+        dados_atualizacao["sticker_reward_id"] = sticker_id
+
+    # 7. Validar período
+    if "periodo_id" in body:
+        periodo_id = body["periodo_id"] or None
+
+        if not _uuid_valido(periodo_id):
+            return _error("ID do período inválido.", 400)
+
+        if periodo_id and not _periodo_da_sala(
+            db, periodo_id, sala_id, professor_id
+        ):
+            return _error("Período não encontrado nesta sala.", 404)
+
+        dados_atualizacao["periodo_id"] = periodo_id
+
+    # 8. Validar missão
+    if "missao_id" in body:
+        missao_id = body["missao_id"] or None
+
+        if not _uuid_valido(missao_id):
+            return _error("ID da missão inválido.", 400)
+
+        if missao_id and not _missao_da_sala(
+            db, missao_id, sala_id, professor_id
+        ):
+            return _error("Missão não encontrada nesta sala.", 404)
+
+        dados_atualizacao["missao_id"] = missao_id
+
+    # 9. Validar perguntas, caso tenham sido enviadas
+    novas_perguntas = None
+
+    if "perguntas" in body:
+        novas_perguntas, erro = _normalizar_perguntas_quiz(
+            body["perguntas"]
+        )
+
+        if erro:
+            return _error(erro, 400)
+
+    if not dados_atualizacao and novas_perguntas is None:
+        return _error("Nenhum campo válido foi informado para atualização.", 400)
+
+    # 10. Guardar estado original para permitir compensação em caso de falha
+    campos_originais = {
+        campo: quiz_atual.get(campo)
+        for campo in (
+            "titulo",
+            "descricao",
+            "dificuldade",
+            "xp_reward",
+            "sticker_reward_id",
+            "periodo_id",
+            "missao_id"
+        )
+    }
+
+    perguntas_originais = []
+    perguntas_removidas = False
+    metadados_atualizados = False
+
+    try:
+        if novas_perguntas is not None:
+            perguntas_originais = (
+                db.table("question")
+                .select("*")
+                .eq("quiz_id", quiz_id)
+                .order("ordem")
+                .execute()
+                .data or []
+            )
+
+        # Atualizar dados gerais
+        if dados_atualizacao:
+            atualizacao_r = (
+                db.table("quiz")
+                .update(dados_atualizacao)
+                .eq("id", quiz_id)
+                .eq("sala_id", sala_id)
+                .execute()
+            )
+
+            if not atualizacao_r.data:
+                raise RuntimeError("Não foi possível atualizar o questionário.")
+
+            quiz_atualizado = atualizacao_r.data[0]
+            metadados_atualizados = True
+        else:
+            quiz_atualizado = quiz_atual
+
+        # Substituir perguntas somente quando o campo foi enviado
+        if novas_perguntas is not None:
+
+            db.table("question").delete().eq(
+                "quiz_id", quiz_id
+            ).execute()
+
+            perguntas_removidas = True
+
+            perguntas_para_inserir = [
+                {
+                    **pergunta,
+                    "quiz_id": quiz_id
+                }
+                for pergunta in novas_perguntas
+            ]
+
+            insercao_r = (
+                db.table("question")
+                .insert(perguntas_para_inserir)
+                .execute()
+            )
+
+            if len(insercao_r.data or []) != len(perguntas_para_inserir):
+                raise RuntimeError("Não foi possível salvar todas as perguntas.")
+
+            perguntas_salvas = insercao_r.data
+
+        else:
+            perguntas_salvas = None
+
+        return _success({
+            "message": "Questionário atualizado com sucesso.",
+            "quiz": quiz_atualizado,
+            "perguntas": perguntas_salvas,
+            "perguntas_atualizadas": novas_perguntas is not None
+        })
+
+    except Exception:
+        # Se a substituição falhar, tentar restaurar as perguntas anteriores.
+        if perguntas_removidas:
+            try:
+                db.table("question").delete().eq(
+                    "quiz_id", quiz_id
+                ).execute()
+
+                if perguntas_originais:
+                    db.table("question").insert(
+                        perguntas_originais
+                    ).execute()
+
+            except Exception:
+                app.logger.exception(
+                    "Falha ao restaurar as perguntas anteriores do quiz."
+                )
+
+        # Restaurar os metadados anteriores, se necessário.
+        if metadados_atualizados:
+            try:
+                db.table("quiz").update(
+                    campos_originais
+                ).eq("id", quiz_id).eq(
+                    "sala_id", sala_id
+                ).execute()
+
+            except Exception:
+                app.logger.exception(
+                    "Falha ao restaurar os metadados anteriores do quiz."
+                )
+
+        app.logger.exception("Erro ao editar questionário.")
+
+        return _error(
+            "Não foi possível atualizar o questionário. Tente novamente.",
+            500
+        )
+
+
+# =============================================================================
+# PROFESSOR — EXCLUIR QUESTIONÁRIO
+# =============================================================================
+
+@app.route(
+    "/api/professor/salas/<sala_id>/quizzes/<quiz_id>",
+    methods=["DELETE"]
+)
+@token_required
+@professor_required
+def excluir_quiz(current_user, sala_id, quiz_id):
+
+    db = get_user_supabase()
+    professor_id = current_user["id"]
+
+    # 1. Validar UUIDs
+    if not _uuid_valido(sala_id) or not _uuid_valido(quiz_id):
+        return _error("ID da sala ou do questionário inválido.", 400)
+
+    # 2. Verificar propriedade da sala
+    if not _sala_do_professor(db, sala_id, professor_id):
+        return _error("Sala não encontrada ou sem permissão.", 404)
+
+    try:
+        # 3. Confirmar que o questionário pertence à sala
+        quiz_r = (
+            db.table("quiz")
+            .select("id, titulo, sala_id")
+            .eq("id", quiz_id)
+            .eq("sala_id", sala_id)
+            .execute()
+        )
+
+        if not quiz_r.data:
+            return _error("Questionário não encontrado nesta sala.", 404)
+
+        # 4. Verificar se existem resultados de alunos
+        tentativas = (
+            db.table("quiz_progress")
+            .select("id")
+            .eq("quiz_id", quiz_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+
+        if tentativas:
+            return _error(
+                "Este questionário possui respostas registradas e não pode ser excluído. "
+                "O histórico dos alunos precisa ser preservado.",
+                409
+            )
+
+        # 5. Excluir o questionário
+        excluido = (
+            db.table("quiz")
+            .delete()
+            .eq("id", quiz_id)
+            .eq("sala_id", sala_id)
+            .execute()
+        )
+
+        if not excluido.data:
+            return _error("Não foi possível excluir o questionário.", 404)
+
+        # As perguntas são removidas automaticamente pela FK ON DELETE CASCADE.
+        return _success({
+            "message": "Questionário excluído com sucesso.",
+            "quiz_id": quiz_id,
+            "titulo": quiz_r.data[0]["titulo"]
+        })
+
+    except Exception:
+        app.logger.exception("Erro ao excluir questionário.")
+
+        return _error(
+            "Ocorreu um erro ao excluir o questionário.",
+            500
+        )
+
+
 @app.route("/api/professor/salas/<sala_id>/desempenho-consolidado", methods=["GET"])
 @token_required
 @professor_required
