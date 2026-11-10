@@ -933,33 +933,6 @@ def logout(current_user):
     return _success({"message": "Sessão encerrada."})
 
 
-@app.route("/api/perfil", methods=["GET"])
-@token_required
-def ver_perfil(current_user):
-    """
-    Consulta atualizada do perfil do usuário autenticado: nome, e-mail e XP.
-
-    Sempre busca direto na tabela `perfis` (não usa o `current_user` do
-    decorator, que só tem id/nome/role/email) para trazer o `xp` já
-    atualizado por qualquer trigger (ex: handle_mission_xp_reward) — o JWT
-    em si não carrega XP, então este é o único jeito confiável de ter o
-    valor corrente.
-
-    NOTA: avatar/foto de perfil foi removido do produto; este endpoint
-    retorna apenas nome, e-mail, role e xp.
-    """
-    db = get_user_supabase()
-    r = (
-        db.table("perfis")
-        .select("id, nome, email, role, xp")
-        .eq("id", current_user["id"])
-        .execute()
-    )
-    if not r.data:
-        return _error("Perfil não encontrado.", 404)
-    return _success(r.data[0])
-
-
 # =============================================================================
 # PROFESSOR — SALAS
 # =============================================================================
