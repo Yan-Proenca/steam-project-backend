@@ -16,7 +16,6 @@ from google.genai import types
 
 load_dotenv()
 
-# Obtenha a URL do front-end a partir do ambiente ou use o padrão local para desenvolvimento
 app = Flask(__name__)
 CORS(app)
 
@@ -38,12 +37,6 @@ if not SUPABASE_SERVICE_KEY:
         "⚠️  AVISO: SUPABASE_SERVICE_KEY não configurada — /api/auth/cadastro "
         "e a revogação de sessão em /api/auth/logout não vão funcionar."
     )
-
-# -----------------------------------------------------------------------------
-# Client administrativo (Service Role) — uso restrito, ver docstring acima.
-# Estático (nunca sofre .auth(token) nem sign_in), então é seguro mantê-lo
-# como singleton de módulo, compartilhado entre requisições.
-# -----------------------------------------------------------------------------
 supabase_admin: Client = (
     create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
 )
@@ -129,7 +122,6 @@ def _get_token_from_header():
 # =============================================================================
 _EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 
-# Mínimo 8 caracteres, 1 maiúscula, 1 minúscula, 1 número, 1 caractere especial
 _SENHA_MAIUSCULA = re.compile(r"[A-Z]")
 _SENHA_MINUSCULA = re.compile(r"[a-z]")
 _SENHA_NUMERO = re.compile(r"[0-9]")
@@ -333,11 +325,6 @@ def professor_required(f):
 # =============================================================================
 # VALIDAÇÃO DE POSSE (CAMADA 2 — checagem explícita além do RLS)
 # -----------------------------------------------------------------------------
-# Cada helper abaixo confirma que um recurso (período, missão, equipe,
-# material) pertence à sala informada E que a sala pertence ao professor
-# autenticado, retornando o registro ou None. As rotas transformam "None"
-# em 404. Nunca fazemos `.eq("id", recurso_id)` isolado em PUT/DELETE.
-# =============================================================================
 def _sala_do_professor(db, sala_id, professor_id):
     r = (
         db.table("salas")
@@ -733,8 +720,6 @@ def cadastro():
 
         user = auth_response.user
 
-        # 🔒 Força a confirmação do e-mail automaticamente pelo Admin do Supabase
-        # para que o usuário consiga fazer login de imediato.
         try:
             supabase_admin.auth.admin.update_user_by_id(
                 user.id,
@@ -743,7 +728,6 @@ def cadastro():
         except Exception:
             pass
 
-        # Garante que o perfil é inserido/atualizado corretamente
         supabase_admin.table("perfis").upsert({
             "id": user.id,
             "nome": nome,
@@ -780,7 +764,6 @@ def esqueci_senha():
         return _error("Serviço indisponível.", 500)
 
     try:
-        # 1. Gera o link de recuperação seguro no Supabase (sem usar o limite baixo de e-mails nativos)[cite: 1]
         response = supabase_admin.auth.admin.generate_link({
             "type": "recovery",
             "email": email
@@ -798,7 +781,6 @@ def esqueci_senha():
                 "Supabase não retorno o link de recuperação"
             )
         
-        # 2. Se o e-mail existir e o link for gerado, dispara o EmailJS a partir do back-end[cite: 1, 2]
         if action_link:
             url_emailjs = "https://api.emailjs.com/api/v1.0/email/send"
             
@@ -828,7 +810,6 @@ def esqueci_senha():
     except Exception as e:
         print(f"⚠️ Erro ao processar recuperação: {str(e)}")
 
-    # 3. Retorno sempre genérico para proteger a plataforma contra enumeração de e-mails
     return _success({
         "message": "Se este e-mail estiver cadastrado, as instruções de recuperação foram enviadas."
     })
@@ -850,7 +831,6 @@ def redefinir_senha(current_user):
 
     token = _get_token_from_header()
     try:
-        # Mantém a mesma lógica robusta que já estava no seu app.py para atualizar a senha via token JWT de recuperação
         auth_client = _new_anon_client()
         auth_client.auth._request("PUT", "user", body={"password": nova_senha}, jwt=token)
         return _success({"message": "Senha redefinida com sucesso."})
@@ -1237,8 +1217,6 @@ def cadastrar_missao(current_user, sala_id):
     if erro_modalidade:
         return _error(erro_modalidade, 400)
 
-    # 🔒 Anexo (opcional) vai para o bucket compartilhado "anexos_geral",
-    # sob o prefixo "missoes/", com nome gerado via uuid4().
     anexo_url = None
     if anexo and anexo.filename:
         anexo_url, erro_anexo = _upload_anexo_geral(db, anexo, "missoes/")
@@ -1319,8 +1297,6 @@ def editar_missao(current_user, sala_id, missao_id):
     if erro_modalidade:
         return _error(erro_modalidade, 400)
 
-    # 🔒 Anexo (opcional) substitui o anterior; se nada for enviado, o
-    # campo "anexo_url" não é alterado (missão mantém o anexo existente).
     dados = {
         "titulo": body.get("titulo"),
         "descricao": body.get("descricao"),
@@ -1359,20 +1335,6 @@ def excluir_missao(current_user, sala_id, missao_id):
         return _success({"message": "Missão removida da trilha."})
     except Exception as e:
         return _error(str(e), 500)
-
-
-# =============================================================================
-# STICKERS — SEM CRUD NO BACKEND
-# -----------------------------------------------------------------------------
-# O catálogo de stickers (public.stickers) e as imagens no bucket "stickers"
-# são geridos EXCLUSIVAMENTE pelo Admin via Supabase Dashboard (Table Editor
-# + Storage), usando a service_role key. Esta API não expõe mais nenhuma
-# rota de CRUD para stickers — eles continuam sendo lidos (somente leitura,
-# via RLS `stickers_select`) e vinculados a missões/quizzes como recompensa,
-# conforme já implementado em cadastrar_missao/editar_missao, corrigir_entrega
-# e handle_quiz_completion_rewards.
-# =============================================================================
-
 
 # =============================================================================
 # PROFESSOR — ALUNOS DA SALA
@@ -1525,8 +1487,6 @@ def adicionar_membro_equipe(current_user, sala_id, equipe_id):
     if not aluno_id:
         return _error("Informe o aluno.")
 
-    # 🔒 Garante que o aluno pertence à MESMA sala da equipe (não apenas
-    # que ele existe em algum lugar da plataforma).
     matricula = (
         db.table("aluno_salas")
         .select("aluno_id")
@@ -1617,11 +1577,6 @@ def avisos_equipe_professor(current_user, sala_id, equipe_id):
 
 # =============================================================================
 # ALUNO — EQUIPE (tarefas compartilhadas + mural de avisos)
-# -----------------------------------------------------------------------------
-# Cadastro de equipes e associação de integrantes são geridos pelo professor
-# (seção acima). Aqui: o próprio aluno consultando sua equipe, e os membros
-# gerenciando tarefas/avisos — exclusivamente entre eles (o professor só lê,
-# nas rotas acima).
 # =============================================================================
 @app.route("/api/aluno/equipe", methods=["GET"])
 @token_required
@@ -1705,7 +1660,6 @@ def criar_tarefa_equipe(current_user, equipe_id):
         return _error("Status inválido. Use 'pendente', 'em_andamento' ou 'concluida'.", 400)
 
     try:
-        # 🔒 criado_por vem sempre de current_user, nunca do body.
         r = db.table("equipe_tarefas").insert({
             "equipe_id": equipe_id,
             "titulo": titulo,
@@ -1714,7 +1668,7 @@ def criar_tarefa_equipe(current_user, equipe_id):
             "status": status,
             "criado_por": aluno_id,
         }).execute()
-        # 🔔 Só notifica se houver responsável definido e ele não for quem criou a tarefa.
+
         if responsavel_id and responsavel_id != aluno_id:
             _criar_notificacao(
                 db, responsavel_id,
@@ -1830,7 +1784,6 @@ def criar_aviso_equipe(current_user, equipe_id):
         return _error("O texto do aviso é obrigatório.")
 
     try:
-        # 🔒 autor_id vem sempre de current_user, nunca do body.
         r = db.table("equipe_avisos").insert({
             "equipe_id": equipe_id,
             "autor_id": aluno_id,
@@ -2103,8 +2056,6 @@ def corrigir_entrega(current_user, progresso_id):
         }
 
         if equipe_id:
-            # Lançamento em grupo: todas as entregas desta equipe para esta
-            # mesma missão recebem a mesma nota/feedback de uma vez.
             upd = (
                 db.table("progresso_missoes")
                 .update(dados_correcao)
@@ -2116,7 +2067,6 @@ def corrigir_entrega(current_user, progresso_id):
                 return _error("Não foi possível corrigir esta entrega.", 403)
             for linha in upd.data:
                 _conceder_sticker_se_houver(db, linha["aluno_id"], sticker_id)
-                # 🔔 Um por membro da equipe — mesma nota, mesma mensagem.
                 _criar_notificacao(
                     db, linha["aluno_id"],
                     "Sua missão foi corrigida!",
@@ -2128,20 +2078,16 @@ def corrigir_entrega(current_user, progresso_id):
                 "membros_afetados": len(upd.data),
             })
 
-        # Missão individual: corrige só esta linha.
         upd = (
             db.table("progresso_missoes")
             .update(dados_correcao)
             .eq("id", progresso_id)
             .execute()
         )
-        # 🔒 Camada 2, reforço pós-escrita: se 0 linhas foram afetadas (ex.:
-        # posse mudou entre a checagem e o update), não reportamos sucesso.
         if not upd.data:
             return _error("Não foi possível corrigir esta entrega.", 403)
 
         _conceder_sticker_se_houver(db, progresso["aluno_id"], sticker_id)
-        # 🔔 Notifica o aluno dono da entrega.
         _criar_notificacao(
             db, progresso["aluno_id"],
             "Sua missão foi corrigida!",
@@ -2213,9 +2159,6 @@ def pauta(current_user, sala_id):
 
     periodos = db.table("periodos").select("id, nome, meta_missoes").eq("sala_id", sala_id).order("criado_em").execute().data
 
-    # Pauta só considera missões PUBLICADAS — um rascunho não tem nota
-    # ainda (o aluno nem vê o conteúdo dele), então não faz sentido entrar
-    # no cálculo da média.
     q_missoes = db.table("missoes").select("id, titulo, peso_nota, ordem").eq("sala_id", sala_id).eq("status", "publicada")
     if periodo_id:
         q_missoes = q_missoes.eq("periodo_id", periodo_id)
@@ -2311,11 +2254,9 @@ def editar_quiz(current_user, sala_id, quiz_id):
     db = get_user_supabase()
     professor_id = current_user["id"]
 
-    # 1. Validar UUIDs
     if not _uuid_valido(sala_id) or not _uuid_valido(quiz_id):
         return _error("ID da sala ou do questionário inválido.", 400)
 
-    # 2. Verificar propriedade da sala
     if not _sala_do_professor(db, sala_id, professor_id):
         return _error("Sala não encontrada ou sem permissão.", 404)
 
@@ -2360,7 +2301,6 @@ def editar_quiz(current_user, sala_id, quiz_id):
 
     quiz_atual = quiz_r.data[0]
 
-    # 4. Preservar o histórico: não editar questionários já respondidos
     tentativas = (
         db.table("quiz_progress")
         .select("id")
@@ -2376,7 +2316,6 @@ def editar_quiz(current_user, sala_id, quiz_id):
             409
         )
 
-    # 5. Validar os campos enviados
     dados_atualizacao = {}
 
     if "titulo" in body:
@@ -2436,7 +2375,6 @@ def editar_quiz(current_user, sala_id, quiz_id):
 
         dados_atualizacao["xp_reward"] = xp_reward
 
-    # 6. Validar sticker opcional
     if "sticker_reward_id" in body:
         sticker_id = body["sticker_reward_id"] or None
 
@@ -2456,7 +2394,6 @@ def editar_quiz(current_user, sala_id, quiz_id):
 
         dados_atualizacao["sticker_reward_id"] = sticker_id
 
-    # 7. Validar período
     if "periodo_id" in body:
         periodo_id = body["periodo_id"] or None
 
@@ -2470,7 +2407,6 @@ def editar_quiz(current_user, sala_id, quiz_id):
 
         dados_atualizacao["periodo_id"] = periodo_id
 
-    # 8. Validar missão
     if "missao_id" in body:
         missao_id = body["missao_id"] or None
 
@@ -2484,7 +2420,6 @@ def editar_quiz(current_user, sala_id, quiz_id):
 
         dados_atualizacao["missao_id"] = missao_id
 
-    # 9. Validar perguntas, caso tenham sido enviadas
     novas_perguntas = None
 
     if "perguntas" in body:
@@ -2498,7 +2433,6 @@ def editar_quiz(current_user, sala_id, quiz_id):
     if not dados_atualizacao and novas_perguntas is None:
         return _error("Nenhum campo válido foi informado para atualização.", 400)
 
-    # 10. Guardar estado original para permitir compensação em caso de falha
     campos_originais = {
         campo: quiz_atual.get(campo)
         for campo in (
@@ -2527,7 +2461,6 @@ def editar_quiz(current_user, sala_id, quiz_id):
                 .data or []
             )
 
-        # Atualizar dados gerais
         if dados_atualizacao:
             atualizacao_r = (
                 db.table("quiz")
@@ -2545,7 +2478,6 @@ def editar_quiz(current_user, sala_id, quiz_id):
         else:
             quiz_atualizado = quiz_atual
 
-        # Substituir perguntas somente quando o campo foi enviado
         if novas_perguntas is not None:
 
             db.table("question").delete().eq(
@@ -2584,7 +2516,6 @@ def editar_quiz(current_user, sala_id, quiz_id):
         })
 
     except Exception:
-        # Se a substituição falhar, tentar restaurar as perguntas anteriores.
         if perguntas_removidas:
             try:
                 db.table("question").delete().eq(
@@ -2601,7 +2532,6 @@ def editar_quiz(current_user, sala_id, quiz_id):
                     "Falha ao restaurar as perguntas anteriores do quiz."
                 )
 
-        # Restaurar os metadados anteriores, se necessário.
         if metadados_atualizados:
             try:
                 db.table("quiz").update(
@@ -2638,16 +2568,13 @@ def excluir_quiz(current_user, sala_id, quiz_id):
     db = get_user_supabase()
     professor_id = current_user["id"]
 
-    # 1. Validar UUIDs
     if not _uuid_valido(sala_id) or not _uuid_valido(quiz_id):
         return _error("ID da sala ou do questionário inválido.", 400)
 
-    # 2. Verificar propriedade da sala
     if not _sala_do_professor(db, sala_id, professor_id):
         return _error("Sala não encontrada ou sem permissão.", 404)
 
     try:
-        # 3. Confirmar que o questionário pertence à sala
         quiz_r = (
             db.table("quiz")
             .select("id, titulo, sala_id")
@@ -2659,7 +2586,6 @@ def excluir_quiz(current_user, sala_id, quiz_id):
         if not quiz_r.data:
             return _error("Questionário não encontrado nesta sala.", 404)
 
-        # 4. Verificar se existem resultados de alunos
         tentativas = (
             db.table("quiz_progress")
             .select("id")
@@ -2676,7 +2602,6 @@ def excluir_quiz(current_user, sala_id, quiz_id):
                 409
             )
 
-        # 5. Excluir o questionário
         excluido = (
             db.table("quiz")
             .delete()
@@ -2688,7 +2613,6 @@ def excluir_quiz(current_user, sala_id, quiz_id):
         if not excluido.data:
             return _error("Não foi possível excluir o questionário.", 404)
 
-        # As perguntas são removidas automaticamente pela FK ON DELETE CASCADE.
         return _success({
             "message": "Questionário excluído com sucesso.",
             "quiz_id": quiz_id,
@@ -2716,16 +2640,6 @@ def desempenho_consolidado(current_user, sala_id):
     periodos = db.table("periodos").select("id, nome").eq("sala_id", sala_id).order("criado_em").execute().data
 
     try:
-        # ⚠️ NOTA DE SEGURANÇA (schema, fora do escopo deste arquivo):
-        # `vw_desempenho_consolidado` é uma VIEW comum. Se ela não foi criada
-        # com `security_invoker = true` (Postgres 15+), views no Supabase
-        # tendem a herdar os privilégios de quem as criou (normalmente o
-        # role `postgres`, que tem BYPASSRLS) — ou seja, a query pode
-        # devolver linhas de OUTRAS salas mesmo com RLS habilitado nas
-        # tabelas de origem. O filtro explícito por `sala_id` abaixo (já
-        # validado por `_sala_do_professor`) é a proteção REAL nesta rota.
-        # Recomendo rodar, uma vez, no banco:
-        #   ALTER VIEW public.vw_desempenho_consolidado SET (security_invoker = true);
         q = db.table("vw_desempenho_consolidado").select("*").eq("sala_id", sala_id)
         if periodo_id:
             missoes_periodo = (
@@ -2799,7 +2713,6 @@ def biblioteca_professor(current_user, sala_id):
     if status_filtro:
         q = q.eq("status", status_filtro)
     else:
-        # Opcional: Se não passar filtro de status, você pode querer esconder os arquivados por padrão:
         q = q.neq("status", "arquivado")
 
     materiais = q.execute().data
@@ -2959,13 +2872,11 @@ def _normalizar_perguntas_quiz(perguntas):
         if not isinstance(item, dict):
             return None, f"A pergunta {indice} possui formato inválido."
 
-        # Enunciado
         enunciado = item.get("question", item.get("pergunta"))
 
         if not isinstance(enunciado, str) or not enunciado.strip():
             return None, f"O enunciado da pergunta {indice} é obrigatório."
 
-        # Alternativas
         if "options" in item or "opcoes" in item:
 
             alternativas = item.get("options", item.get("opcoes"))
@@ -2997,7 +2908,6 @@ def _normalizar_perguntas_quiz(perguntas):
 
             alternativas_normalizadas.append(alternativa.strip())
 
-        # Resposta correta
         resposta_raw = item.get(
             "correct_answer",
             item.get("resposta_correta")
@@ -3011,10 +2921,8 @@ def _normalizar_perguntas_quiz(perguntas):
         resposta_original = resposta_raw.strip()
         resposta = resposta_original.lower()
 
-        # Aceita A, B, C ou D
         if resposta not in letras:
 
-            # Também aceita o próprio texto da alternativa correta.
             correspondencias = [
                 posicao
                 for posicao, alternativa in enumerate(alternativas_normalizadas)
@@ -3030,7 +2938,6 @@ def _normalizar_perguntas_quiz(perguntas):
 
             resposta = letras[correspondencias[0]]
 
-        # Ordem da pergunta
         ordem_raw = item.get("ordem", indice)
 
         if isinstance(ordem_raw, bool):
@@ -3048,7 +2955,6 @@ def _normalizar_perguntas_quiz(perguntas):
 
         ordens_utilizadas.add(ordem)
 
-        # Estrutura final compatível com a tabela question
         normalizadas.append({
             "question": enunciado.strip(),
             "option_a": alternativas_normalizadas[0],
@@ -3111,7 +3017,6 @@ def criar_quiz(current_user, sala_id):
 
     descricao = descricao_raw.strip() or None if descricao_raw else None
 
-    # Dificuldade permitida pelo ENUM dificuldade_quiz
     dificuldade = body.get("dificuldade", "medio")
 
     dificuldades_validas = {
@@ -3131,7 +3036,6 @@ def criar_quiz(current_user, sala_id):
             400
         )
 
-    # XP
     xp_raw = body.get("xp_reward", 0)
 
     if isinstance(xp_raw, bool):
@@ -3213,7 +3117,6 @@ def criar_quiz(current_user, sala_id):
             "missao_id": missao_id
         }
 
-        # Primeiro: inserir o questionário
         quiz_r = (
             db.table("quiz")
             .insert(dados_quiz)
@@ -3226,7 +3129,6 @@ def criar_quiz(current_user, sala_id):
         quiz_criado = quiz_r.data[0]
         quiz_id_criado = quiz_criado["id"]
 
-        # Segundo: vincular todas as perguntas ao questionário
         perguntas_para_inserir = [
             {
                 **pergunta,
@@ -3248,7 +3150,6 @@ def criar_quiz(current_user, sala_id):
                 "Nem todas as perguntas foram salvas no banco."
             )
 
-        # Sucesso
         return _success({
             "message": "Questionário criado com sucesso.",
             "quiz": quiz_criado,
@@ -3479,8 +3380,6 @@ def propor_material_aluno(current_user):
         if erro_anexo:
             return _error(erro_anexo, 400)
 
-    # professor_id é obrigatório na tabela (legado) — preenchido aqui com o
-    # professor da sala, já que quem está propondo é o aluno (criado_por).
     sala_r = db.table("salas").select("professor_id").eq("id", sala_id).execute()
     if not sala_r.data:
         return _error("Sala não encontrada.", 404)
@@ -3500,7 +3399,7 @@ def propor_material_aluno(current_user):
             "criado_por": aluno_id,
             "criado_por_role": "aluno",
         }).execute()
-        # 🔔 Notifica o professor da sala: há um material novo aguardando aprovação.
+
         _criar_notificacao(
             db, professor_id,
             "Novo material pendente de aprovação",
@@ -3567,7 +3466,6 @@ def ver_missao_aluno(current_user, missao_id):
         return _error("Missão não encontrada.", 404)
 
     sala_id = missao["salas"]["id"]
-    # 🔒 Confirma matrícula do aluno NESTA sala antes de liberar a missão
     if _get_vinculo_aluno(db, aluno_id) != sala_id:
         return _error("Acesso negado.", 403)
 
@@ -3593,8 +3491,6 @@ def ver_missao_aluno(current_user, missao_id):
     )
     progresso = prog_r.data[0] if prog_r.data else None
 
-    # Modalidade 'equipe': o aluno precisa ter equipe no período da missão
-    # para visualizar o conteúdo completo e enviar (decisão de produto).
     equipe = None
     if missao.get("modalidade") == "equipe":
         equipe = _equipe_do_aluno_no_periodo(db, aluno_id, sala_id, missao.get("periodo_id"))
@@ -3688,16 +3584,12 @@ def enviar_missao(current_user):
             return _error("Missão não encontrada.", 404)
         missao = missao_r.data[0]
 
-        # 🔒 Confirma matrícula do aluno na sala da missão
         if _get_vinculo_aluno(db, aluno_id) != missao["sala_id"]:
             return _error("Acesso negado.", 403)
 
         if missao.get("status") != "publicada":
             return _error("Esta missão ainda não está disponível.", 403)
 
-        # 🔒 REGRA ÚNICA de desbloqueio — mesma usada na trilha e na
-        # consulta da missão. Sem isso, dava para enviar uma missão "mais à
-        # frente" sem ter completado as anteriores.
         if not _missao_desbloqueada(db, aluno_id, missao_id):
             return _error("Complete as missões anteriores (e aguarde a correção do professor) antes de enviar esta.", 403)
 
@@ -3711,7 +3603,6 @@ def enviar_missao(current_user):
             equipe_id = equipe["id"]
             alunos_destino = [m["id"] for m in equipe["membros"]] or [aluno_id]
 
-        # Se QUALQUER membro já teve a entrega corrigida, ninguém mais pode reenviar.
         existentes = (
             db.table("progresso_missoes")
             .select("id, aluno_id, status")
@@ -3723,9 +3614,7 @@ def enviar_missao(current_user):
             return _error("Esta missão já foi corrigida e não pode ser reenviada.", 409)
         existentes_por_aluno = {e["aluno_id"]: e for e in existentes}
 
-        # 🔒 Anexos (até 3) vão para o bucket compartilhado "anexos_geral",
-        # sob o prefixo "entregas/", cada um com nome gerado via uuid4().
-        anexos_enviados = []  # [{"url":..., "nome_arquivo":...}, ...]
+        anexos_enviados = []  
         for arquivo in anexos:
             url, erro_anexo = _upload_anexo_geral(db, arquivo, "entregas/")
             if erro_anexo:
@@ -3745,14 +3634,8 @@ def enviar_missao(current_user):
             "equipe_id": equipe_id,
         }
         if anexos_enviados:
-            # url_entrega (coluna legada) espelha o 1º anexo, para quem
-            # ainda lê só esse campo; a lista completa fica em
-            # progresso_missoes_anexos.
             dados_entrega["url_entrega"] = anexos_enviados[0]["url"]
 
-        # 🔒 Um INSERT/UPDATE por aluno destino (sempre a partir de
-        # alunos_destino, nunca de um campo livre do body) — em missão
-        # individual, alunos_destino == [aluno_id][o próprio current_user].
         progresso_ids_por_aluno = {}
         for destino_id in alunos_destino:
             existente = existentes_por_aluno.get(destino_id)
@@ -3767,9 +3650,6 @@ def enviar_missao(current_user):
                 }).execute()
                 progresso_ids_por_aluno[destino_id] = r.data[0]["id"]
 
-        # Anexos: substitui os anteriores (delete + insert) em CADA
-        # progresso afetado, para refletir a mesma lista de arquivos em
-        # todos os membros da equipe.
         if anexos_enviados:
             for progresso_id in progresso_ids_por_aluno.values():
                 db.table("progresso_missoes_anexos").delete().eq("progresso_id", progresso_id).execute()
@@ -3807,7 +3687,6 @@ def entrar_sala_por_codigo(current_user):
         if ja_tem.data:
             return _error("Você já está matriculado em uma sala.", 409)
 
-        # 🔒 aluno_id vem sempre de current_user
         db.table("aluno_salas").insert({"aluno_id": aluno_id, "sala_id": sala["id"]}).execute()
         return _success({"message": f"Você entrou na sala '{sala['nome']}'!", "sala": sala}, 201)
     except Exception as e:
@@ -3825,7 +3704,6 @@ def responder_quiz(current_user, quiz_id):
 
     quiz_r = db.table("quiz").select("*").eq("id", quiz_id).execute()
     quiz = quiz_r.data[0] if quiz_r.data else None
-    # 🔒 Confirma que o quiz pertence à sala do aluno
     if not quiz or quiz["sala_id"] != sala_id:
         return _error("Quiz não encontrado ou sem acesso.", 404)
 
@@ -3860,8 +3738,6 @@ def responder_quiz(current_user, quiz_id):
     score = round((correct_answers / total_questions) * 100, 2) if total_questions > 0 else 0.0
 
     try:
-        # 🔒 aluno_id vem sempre de current_user; UNIQUE(aluno_id, quiz_id)
-        # no banco + a policy `qprog_insert` (aluno_id = auth.uid()) reforçam.
         db.table("quiz_progress").insert({
             "aluno_id": aluno_id,
             "quiz_id": quiz_id,
@@ -3907,9 +3783,6 @@ def listar_notificacoes(current_user):
 def marcar_notificacao_lida(current_user, notificacao_id):
     db = get_user_supabase()
     try:
-        # 🔒 .eq("usuario_id", ...) além do RLS — reforço pós-escrita: se 0
-        # linhas foram afetadas, a notificação não existe ou não é do
-        # current_user, e devolvemos 404 em vez de sucesso vazio.
         upd = (
             db.table("notificacoes")
             .update({"lida": True})
@@ -3941,7 +3814,6 @@ def enviar_pergunta_missao(current_user, missao_id):
         return _error("O texto da pergunta não pode estar vazio.", 400)
 
     try:
-        # 1. Valida se a missão existe e pega o sala_id dela
         missao_r = (
             db.table("missoes")
             .select("id, sala_id, titulo")
@@ -3952,11 +3824,9 @@ def enviar_pergunta_missao(current_user, missao_id):
             return _error("Missão não encontrada.", 404)
         missao = missao_r.data[0]
 
-        # 2. Confirma se o aluno está matriculado na sala da missão (Camada 2)
         if _get_vinculo_aluno(db, aluno_id) != missao["sala_id"]:
             return _error("Acesso negado.", 403)
 
-        # 3. Insere a pergunta no banco
         r = db.table("missao_perguntas").insert({
             "missao_id": missao_id,
             "aluno_id": aluno_id,
@@ -3964,7 +3834,6 @@ def enviar_pergunta_missao(current_user, missao_id):
             "status": "pendente"
         }).execute()
 
-        # 4. Notifica o professor da sala
         sala_r = db.table("salas").select("professor_id").eq("id", missao["sala_id"]).execute()
         if sala_r.data:
             professor_id = sala_r.data[0]["professor_id"]
@@ -3999,7 +3868,6 @@ def listar_perguntas_sala(current_user, sala_id):
     status_filtro = request.args.get("status", "").strip().lower()
     missao_filtro = request.args.get("missao_id", "").strip()
 
-    # Buscar todas as missões da sala para validação e mapeamento
     missoes_r = (
         db.table("missoes")
         .select("id, titulo, ordem")
@@ -4014,7 +3882,6 @@ def listar_perguntas_sala(current_user, sala_id):
     missao_ids = [m["id"] for m in missoes_r]
     missoes_map = {m["id"]: m["titulo"] for m in missoes_r}
 
-    # Query principal de perguntas
     q = (
         db.table("missao_perguntas")
         .select("*, perfis(id, nome, email)")
@@ -4030,7 +3897,6 @@ def listar_perguntas_sala(current_user, sala_id):
 
     perguntas_raw = q.execute().data or []
 
-    # Formatar dados de saída
     perguntas = []
     for p in perguntas_raw:
         aluno_perfil = p.get("perfis") or {}
@@ -4077,7 +3943,6 @@ def responder_pergunta(current_user, pergunta_id):
         return _error("O texto da resposta não pode estar vazio.", 400)
 
     try:
-        # 1. Buscar a pergunta com dados da missão associada
         pergunta_r = (
             db.table("missao_perguntas")
             .select("*, missoes(id, titulo, sala_id)")
@@ -4091,11 +3956,9 @@ def responder_pergunta(current_user, pergunta_id):
         missao = pergunta.get("missoes") or {}
         sala_id = missao.get("sala_id")
 
-        # 2. Camada 2: Verificar se a sala pertence ao professor autenticado
         if not sala_id or not _sala_do_professor(db, sala_id, professor_id):
             return _error("Você não tem permissão para responder a esta pergunta.", 403)
 
-        # 3. Atualizar a pergunta no banco
         agora = datetime.now(timezone.utc).isoformat()
         upd = (
             db.table("missao_perguntas")
@@ -4113,7 +3976,6 @@ def responder_pergunta(current_user, pergunta_id):
 
         pergunta_atualizada = upd.data[0]
 
-        # 4. Notificar o aluno que a pergunta dele foi respondida
         _criar_notificacao(
             db,
             pergunta["aluno_id"],
@@ -4146,7 +4008,6 @@ def listar_perguntas_aluno_missao(current_user, missao_id):
     aluno_id = current_user["id"]
 
     try:
-        # 1. Verificar se a missão existe e obter a sala correspondente
         missao_r = (
             db.table("missoes")
             .select("id, sala_id, titulo")
@@ -4158,12 +4019,9 @@ def listar_perguntas_aluno_missao(current_user, missao_id):
         
         missao = missao_r.data[0]
 
-        # 2. Confirmar se o aluno pertence à sala da missão
         if _get_vinculo_aluno(db, aluno_id) != missao["sala_id"]:
             return _error("Acesso negado.", 403)
 
-        # 3. Procurar as perguntas do aluno para esta missão
-        # Nota: O RLS ("perguntas_select") garante que o aluno apenas lê o que lhe é permitido
         perguntas = (
             db.table("missao_perguntas")
             .select("id, texto, resposta, status, criado_em, respondido_em")
@@ -4210,7 +4068,6 @@ def atualizar_avatar(current_user):
         return _error(f"Avatar inválido. Escolha um dos seguintes: {permitidos_str}.", 400)
 
     try:
-        # Usa estritamente o ID do usuário autenticado (current_user), ignorando qualquer input externo
         upd = (
             db.table("perfis")
             .update({"avatar_id": avatar_id})
