@@ -3576,7 +3576,7 @@ def enviar_missao(current_user):
     try:
         missao_r = (
             db.table("missoes")
-            .select("id, sala_id, periodo_id, data_limite, status, modalidade")
+            .select("id, sala_id, periodo_id, data_limite, status, modalidade, titulo")
             .eq("id", missao_id)
             .execute()
         )
@@ -3657,6 +3657,21 @@ def enviar_missao(current_user):
                     {"progresso_id": progresso_id, "url": a["url"], "nome_arquivo": a["nome_arquivo"]}
                     for a in anexos_enviados
                 ]).execute()
+
+        # Notifica o professor da sala de que a missão foi entregue (não é dúvida).
+        sala_r = db.table("salas").select("professor_id").eq("id", missao["sala_id"]).execute()
+        if sala_r.data:
+            professor_id = sala_r.data[0]["professor_id"]
+            if equipe_id:
+                mensagem = f"A equipe de {current_user['nome']} entregou a missão \"{missao['titulo']}\"."
+            else:
+                mensagem = f"{current_user['nome']} entregou a missão \"{missao['titulo']}\"."
+            _criar_notificacao(
+                db, professor_id,
+                "Nova entrega de missão",
+                mensagem,
+                link=f"/professor/salas/{missao['sala_id']}/entregas"
+            )
 
         return _success({
             "message": "Missão enviada! Aguarde a correção do professor. 🚀",
