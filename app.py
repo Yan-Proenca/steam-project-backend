@@ -2240,13 +2240,334 @@ def pauta(current_user, sala_id):
 
 
 # =============================================================================
-# PROFESSOR — EDITAR QUESTIONÁRIO
+# PROFESSOR — QUIZZES
 # =============================================================================
+def _normalizar_perguntas_quiz(perguntas):
+    """
+    Valida e normaliza as perguntas recebidas pelo endpoint.
 
-@app.route(
-    "/api/professor/salas/<sala_id>/quizzes/<quiz_id>",
-    methods=["PATCH"]
-)
+    Aceita dois formatos:
+
+    1. Formato produzido pelo Gemini:
+       {
+           "pergunta": "...",
+           "opcoes": ["A", "B", "C", "D"],
+           "resposta_correta": "A"
+       }
+
+    2. Formato compatível com as colunas do banco:
+       {
+           "question": "...",
+           "option_a": "...",
+           "option_b": "...",
+           "option_c": "...",
+           "option_d": "...",
+           "correct_answer": "a"
+       }
+
+    Retorna (perguntas_normalizadas, None) ou (None, mensagem_erro).
+    """
+
+    if not isinstance(perguntas, list) or not perguntas:
+        return None, "O questionário precisa possuir pelo menos uma pergunta."
+
+    normalizadas = []
+    ordens_utilizadas = set()
+
+    letras = ("a", "b", "c", "d")
+
+    for indice, item in enumerate(perguntas, start=1):
+
+        if not isinstance(item, dict):
+            return None, f"A pergunta {indice} possui formato inválido."
+
+        enunciado = item.get("question", item.get("pergunta"))
+
+        if not isinstance(enunciado, str) or not enunciado.strip():
+            return None, f"O enunciado da pergunta {indice} é obrigatório."
+
+        if "options" in item or "opcoes" in item:
+
+            alternativas = item.get("options", item.get("opcoes"))
+
+        else:
+
+            alternativas = [
+                item.get("option_a"),
+                item.get("option_b"),
+                item.get("option_c"),
+                item.get("option_d")
+            ]
+
+        if not isinstance(alternativas, list) or len(alternativas) != 4:
+            return None, (
+                f"A pergunta {indice} precisa possuir exatamente "
+                "quatro alternativas."
+            )
+
+        alternativas_normalizadas = []
+
+        for alternativa in alternativas:
+
+            if not isinstance(alternativa, str) or not alternativa.strip():
+                return None, (
+                    f"Todas as alternativas da pergunta {indice} "
+                    "precisam ser preenchidas."
+                )
+
+            alternativas_normalizadas.append(alternativa.strip())
+
+        resposta_raw = item.get(
+            "correct_answer",
+            item.get("resposta_correta")
+        )
+
+        if not isinstance(resposta_raw, str) or not resposta_raw.strip():
+            return None, (
+                f"A resposta correta da pergunta {indice} é obrigatória."
+            )
+
+        resposta_original = resposta_raw.strip()
+        resposta = resposta_original.lower()
+
+        if resposta not in letras:
+
+            correspondencias = [
+                posicao
+                for posicao, alternativa in enumerate(alternativas_normalizadas)
+                if alternativa.casefold() == resposta_original.casefold()
+            ]
+
+            if len(correspondencias) != 1:
+                return None, (
+                    f"A resposta correta da pergunta {indice} deve "
+                    "corresponder a A, B, C ou D, ou ao texto de uma "
+                    "única alternativa."
+                )
+
+            resposta = letras[correspondencias[0]]
+
+        ordem_raw = item.get("ordem", indice)
+
+        if isinstance(ordem_raw, bool):
+            return None, f"A ordem da pergunta {indice} é inválida."
+
+        try:
+            ordem = int(ordem_raw)
+        except (ValueError, TypeError):
+            return None, f"A ordem da pergunta {indice} é inválida."
+
+        if ordem < 1 or ordem in ordens_utilizadas:
+            return None, (
+                f"A ordem {ordem} é inválida ou já está sendo utilizada."
+            )
+
+        ordens_utilizadas.add(ordem)
+
+        normalizadas.append({
+            "question": enunciado.strip(),
+            "option_a": alternativas_normalizadas[0],
+            "option_b": alternativas_normalizadas[1],
+            "option_c": alternativas_normalizadas[2],
+            "option_d": alternativas_normalizadas[3],
+            "correct_answer": resposta,
+            "ordem": ordem
+        })
+
+    return normalizadas, None
+
+
+@app.route("/api/professor/salas/<sala_id>/quizzes", methods=["POST"])
+@token_required
+@professor_required
+def criar_quiz(current_user, sala_id):
+
+    db = get_user_supabase()
+
+    if not _uuid_valido(sala_id):
+        return _error("ID da sala inválido.", 400)
+
+    sala = _sala_do_professor(
+        db,
+        sala_id,
+        current_user["id"]
+    )
+
+    if not sala:
+        return _error("Sala não encontrada ou sem permissão.", 404)
+
+    body = request.get_json(silent=True)
+
+    if not isinstance(body, dict):
+        return _error("Envie os dados do questionário em formato JSON.", 400)
+
+    titulo_raw = body.get("titulo")
+
+    if not isinstance(titulo_raw, str) or not titulo_raw.strip():
+        return _error("O título do questionário é obrigatório.", 400)
+
+    titulo = titulo_raw.strip()
+
+    descricao_raw = body.get("descricao")
+
+    if descricao_raw is not None and not isinstance(descricao_raw, str):
+        return _error("A descrição precisa ser um texto.", 400)
+
+    descricao = descricao_raw.strip() or None if descricao_raw else None
+
+    dificuldade = body.get("dificuldade", "medio")
+
+    dificuldades_validas = {
+        "facil",
+        "medio",
+        "dificil"
+    }
+
+    if not isinstance(dificuldade, str):
+        return _error("Dificuldade inválida.", 400)
+
+    dificuldade = dificuldade.strip().lower()
+
+    if dificuldade not in dificuldades_validas:
+        return _error(
+            "Dificuldade inválida. Utilize facil, medio ou dificil.",
+            400
+        )
+
+    xp_raw = body.get("xp_reward", 0)
+
+    if isinstance(xp_raw, bool):
+        return _error("A recompensa de XP precisa ser um número inteiro.", 400)
+
+    try:
+        xp_reward = int(xp_raw)
+    except (ValueError, TypeError):
+        return _error("A recompensa de XP precisa ser um número inteiro.", 400)
+
+    if isinstance(xp_raw, float) and not xp_raw.is_integer():
+        return _error("A recompensa de XP precisa ser um número inteiro.", 400)
+
+    if xp_reward < 0:
+        return _error("A recompensa de XP não pode ser negativa.", 400)
+
+    periodo_id = body.get("periodo_id") or None
+
+    if not _uuid_valido(periodo_id):
+        return _error("ID do período inválido.", 400)
+
+    if periodo_id and not _periodo_da_sala(
+        db,
+        periodo_id,
+        sala_id,
+        current_user["id"]
+    ):
+        return _error("Período não encontrado nesta sala.", 404)
+
+    missao_id = body.get("missao_id") or None
+
+    if not _uuid_valido(missao_id):
+        return _error("ID da missão inválido.", 400)
+
+    if missao_id and not _missao_da_sala(
+        db,
+        missao_id,
+        sala_id,
+        current_user["id"]
+    ):
+        return _error("Missão não encontrada nesta sala.", 404)
+
+    sticker_reward_id = body.get("sticker_reward_id") or None
+
+    if not _uuid_valido(sticker_reward_id):
+        return _error("ID do sticker de recompensa inválido.", 400)
+
+    perguntas, erro_perguntas = _normalizar_perguntas_quiz(
+        body.get("perguntas")
+    )
+
+    if erro_perguntas:
+        return _error(erro_perguntas, 400)
+
+    quiz_id_criado = None
+
+    try:
+
+        dados_quiz = {
+            "sala_id": sala_id,
+            "titulo": titulo,
+            "descricao": descricao,
+            "dificuldade": dificuldade,
+            "xp_reward": xp_reward,
+            "sticker_reward_id": sticker_reward_id,
+            "periodo_id": periodo_id,
+            "missao_id": missao_id
+        }
+
+        quiz_r = (
+            db.table("quiz")
+            .insert(dados_quiz)
+            .execute()
+        )
+
+        if not quiz_r.data:
+            raise RuntimeError("O banco não retornou o questionário criado.")
+
+        quiz_criado = quiz_r.data[0]
+        quiz_id_criado = quiz_criado["id"]
+
+        perguntas_para_inserir = [
+            {
+                **pergunta,
+                "quiz_id": quiz_id_criado
+            }
+            for pergunta in perguntas
+        ]
+
+        perguntas_r = (
+            db.table("question")
+            .insert(perguntas_para_inserir)
+            .execute()
+        )
+
+        perguntas_salvas = perguntas_r.data or []
+
+        if len(perguntas_salvas) != len(perguntas_para_inserir):
+            raise RuntimeError(
+                "Nem todas as perguntas foram salvas no banco."
+            )
+
+        return _success({
+            "message": "Questionário criado com sucesso.",
+            "quiz": quiz_criado,
+            "perguntas": perguntas_salvas,
+            "total_perguntas": len(perguntas_salvas)
+        }, 201)
+
+    except Exception:
+        if quiz_id_criado:
+
+            try:
+                (
+                    db.table("quiz")
+                    .delete()
+                    .eq("id", quiz_id_criado)
+                    .eq("sala_id", sala_id)
+                    .execute()
+                )
+
+            except Exception:
+                app.logger.exception(
+                    "Falha ao desfazer a criação parcial do quiz."
+                )
+
+        app.logger.exception("Erro ao criar questionário.")
+
+        return _error(
+            "Não foi possível criar o questionário. Verifique os dados e tente novamente.",
+            500
+        )
+
+@app.route("/api/professor/salas/<sala_id>/quizzes/<quiz_id>", methods=["PATCH"])
 @token_required
 @professor_required
 def editar_quiz(current_user, sala_id, quiz_id):
@@ -2552,15 +2873,7 @@ def editar_quiz(current_user, sala_id, quiz_id):
             500
         )
 
-
-# =============================================================================
-# PROFESSOR — EXCLUIR QUESTIONÁRIO
-# =============================================================================
-
-@app.route(
-    "/api/professor/salas/<sala_id>/quizzes/<quiz_id>",
-    methods=["DELETE"]
-)
+@app.route("/api/professor/salas/<sala_id>/quizzes/<quiz_id>", methods=["DELETE"])
 @token_required
 @professor_required
 def excluir_quiz(current_user, sala_id, quiz_id):
@@ -2826,360 +3139,6 @@ def excluir_material(current_user, sala_id, material_id):
         return _success({"message": "Material removido."})
     except Exception as e:
         return _error(str(e), 500)
-
-
-
-# =============================================================================
-# PROFESSOR — CRIAÇÃO DE QUIZZES
-# =============================================================================
-
-def _normalizar_perguntas_quiz(perguntas):
-    """
-    Valida e normaliza as perguntas recebidas pelo endpoint.
-
-    Aceita dois formatos:
-
-    1. Formato produzido pelo Gemini:
-       {
-           "pergunta": "...",
-           "opcoes": ["A", "B", "C", "D"],
-           "resposta_correta": "A"
-       }
-
-    2. Formato compatível com as colunas do banco:
-       {
-           "question": "...",
-           "option_a": "...",
-           "option_b": "...",
-           "option_c": "...",
-           "option_d": "...",
-           "correct_answer": "a"
-       }
-
-    Retorna (perguntas_normalizadas, None) ou (None, mensagem_erro).
-    """
-
-    if not isinstance(perguntas, list) or not perguntas:
-        return None, "O questionário precisa possuir pelo menos uma pergunta."
-
-    normalizadas = []
-    ordens_utilizadas = set()
-
-    letras = ("a", "b", "c", "d")
-
-    for indice, item in enumerate(perguntas, start=1):
-
-        if not isinstance(item, dict):
-            return None, f"A pergunta {indice} possui formato inválido."
-
-        enunciado = item.get("question", item.get("pergunta"))
-
-        if not isinstance(enunciado, str) or not enunciado.strip():
-            return None, f"O enunciado da pergunta {indice} é obrigatório."
-
-        if "options" in item or "opcoes" in item:
-
-            alternativas = item.get("options", item.get("opcoes"))
-
-        else:
-
-            alternativas = [
-                item.get("option_a"),
-                item.get("option_b"),
-                item.get("option_c"),
-                item.get("option_d")
-            ]
-
-        if not isinstance(alternativas, list) or len(alternativas) != 4:
-            return None, (
-                f"A pergunta {indice} precisa possuir exatamente "
-                "quatro alternativas."
-            )
-
-        alternativas_normalizadas = []
-
-        for alternativa in alternativas:
-
-            if not isinstance(alternativa, str) or not alternativa.strip():
-                return None, (
-                    f"Todas as alternativas da pergunta {indice} "
-                    "precisam ser preenchidas."
-                )
-
-            alternativas_normalizadas.append(alternativa.strip())
-
-        resposta_raw = item.get(
-            "correct_answer",
-            item.get("resposta_correta")
-        )
-
-        if not isinstance(resposta_raw, str) or not resposta_raw.strip():
-            return None, (
-                f"A resposta correta da pergunta {indice} é obrigatória."
-            )
-
-        resposta_original = resposta_raw.strip()
-        resposta = resposta_original.lower()
-
-        if resposta not in letras:
-
-            correspondencias = [
-                posicao
-                for posicao, alternativa in enumerate(alternativas_normalizadas)
-                if alternativa.casefold() == resposta_original.casefold()
-            ]
-
-            if len(correspondencias) != 1:
-                return None, (
-                    f"A resposta correta da pergunta {indice} deve "
-                    "corresponder a A, B, C ou D, ou ao texto de uma "
-                    "única alternativa."
-                )
-
-            resposta = letras[correspondencias[0]]
-
-        ordem_raw = item.get("ordem", indice)
-
-        if isinstance(ordem_raw, bool):
-            return None, f"A ordem da pergunta {indice} é inválida."
-
-        try:
-            ordem = int(ordem_raw)
-        except (ValueError, TypeError):
-            return None, f"A ordem da pergunta {indice} é inválida."
-
-        if ordem < 1 or ordem in ordens_utilizadas:
-            return None, (
-                f"A ordem {ordem} é inválida ou já está sendo utilizada."
-            )
-
-        ordens_utilizadas.add(ordem)
-
-        normalizadas.append({
-            "question": enunciado.strip(),
-            "option_a": alternativas_normalizadas[0],
-            "option_b": alternativas_normalizadas[1],
-            "option_c": alternativas_normalizadas[2],
-            "option_d": alternativas_normalizadas[3],
-            "correct_answer": resposta,
-            "ordem": ordem
-        })
-
-    return normalizadas, None
-
-
-@app.route(
-    "/api/professor/salas/<sala_id>/quizzes",
-    methods=["POST"]
-)
-@token_required
-@professor_required
-def criar_quiz(current_user, sala_id):
-
-    db = get_user_supabase()
-
-    # ---------------------------------------------------------
-    # 1. Validar sala e propriedade
-    # ---------------------------------------------------------
-
-    if not _uuid_valido(sala_id):
-        return _error("ID da sala inválido.", 400)
-
-    sala = _sala_do_professor(
-        db,
-        sala_id,
-        current_user["id"]
-    )
-
-    if not sala:
-        return _error("Sala não encontrada ou sem permissão.", 404)
-
-    # ---------------------------------------------------------
-    # 2. Receber e validar os dados
-    # ---------------------------------------------------------
-
-    body = request.get_json(silent=True)
-
-    if not isinstance(body, dict):
-        return _error("Envie os dados do questionário em formato JSON.", 400)
-
-    titulo_raw = body.get("titulo")
-
-    if not isinstance(titulo_raw, str) or not titulo_raw.strip():
-        return _error("O título do questionário é obrigatório.", 400)
-
-    titulo = titulo_raw.strip()
-
-    descricao_raw = body.get("descricao")
-
-    if descricao_raw is not None and not isinstance(descricao_raw, str):
-        return _error("A descrição precisa ser um texto.", 400)
-
-    descricao = descricao_raw.strip() or None if descricao_raw else None
-
-    dificuldade = body.get("dificuldade", "medio")
-
-    dificuldades_validas = {
-        "facil",
-        "medio",
-        "dificil"
-    }
-
-    if not isinstance(dificuldade, str):
-        return _error("Dificuldade inválida.", 400)
-
-    dificuldade = dificuldade.strip().lower()
-
-    if dificuldade not in dificuldades_validas:
-        return _error(
-            "Dificuldade inválida. Utilize facil, medio ou dificil.",
-            400
-        )
-
-    xp_raw = body.get("xp_reward", 0)
-
-    if isinstance(xp_raw, bool):
-        return _error("A recompensa de XP precisa ser um número inteiro.", 400)
-
-    try:
-        xp_reward = int(xp_raw)
-    except (ValueError, TypeError):
-        return _error("A recompensa de XP precisa ser um número inteiro.", 400)
-
-    if isinstance(xp_raw, float) and not xp_raw.is_integer():
-        return _error("A recompensa de XP precisa ser um número inteiro.", 400)
-
-    if xp_reward < 0:
-        return _error("A recompensa de XP não pode ser negativa.", 400)
-
-    # ---------------------------------------------------------
-    # 3. Validar relacionamentos opcionais
-    # ---------------------------------------------------------
-
-    periodo_id = body.get("periodo_id") or None
-
-    if not _uuid_valido(periodo_id):
-        return _error("ID do período inválido.", 400)
-
-    if periodo_id and not _periodo_da_sala(
-        db,
-        periodo_id,
-        sala_id,
-        current_user["id"]
-    ):
-        return _error("Período não encontrado nesta sala.", 404)
-
-    missao_id = body.get("missao_id") or None
-
-    if not _uuid_valido(missao_id):
-        return _error("ID da missão inválido.", 400)
-
-    if missao_id and not _missao_da_sala(
-        db,
-        missao_id,
-        sala_id,
-        current_user["id"]
-    ):
-        return _error("Missão não encontrada nesta sala.", 404)
-
-    sticker_reward_id = body.get("sticker_reward_id") or None
-
-    if not _uuid_valido(sticker_reward_id):
-        return _error("ID do sticker de recompensa inválido.", 400)
-
-    # ---------------------------------------------------------
-    # 4. Validar todas as perguntas antes de gravar no banco
-    # ---------------------------------------------------------
-
-    perguntas, erro_perguntas = _normalizar_perguntas_quiz(
-        body.get("perguntas")
-    )
-
-    if erro_perguntas:
-        return _error(erro_perguntas, 400)
-
-    # ---------------------------------------------------------
-    # 5. Criar o questionário e depois suas perguntas
-    # ---------------------------------------------------------
-
-    quiz_id_criado = None
-
-    try:
-
-        dados_quiz = {
-            "sala_id": sala_id,
-            "titulo": titulo,
-            "descricao": descricao,
-            "dificuldade": dificuldade,
-            "xp_reward": xp_reward,
-            "sticker_reward_id": sticker_reward_id,
-            "periodo_id": periodo_id,
-            "missao_id": missao_id
-        }
-
-        quiz_r = (
-            db.table("quiz")
-            .insert(dados_quiz)
-            .execute()
-        )
-
-        if not quiz_r.data:
-            raise RuntimeError("O banco não retornou o questionário criado.")
-
-        quiz_criado = quiz_r.data[0]
-        quiz_id_criado = quiz_criado["id"]
-
-        perguntas_para_inserir = [
-            {
-                **pergunta,
-                "quiz_id": quiz_id_criado
-            }
-            for pergunta in perguntas
-        ]
-
-        perguntas_r = (
-            db.table("question")
-            .insert(perguntas_para_inserir)
-            .execute()
-        )
-
-        perguntas_salvas = perguntas_r.data or []
-
-        if len(perguntas_salvas) != len(perguntas_para_inserir):
-            raise RuntimeError(
-                "Nem todas as perguntas foram salvas no banco."
-            )
-
-        return _success({
-            "message": "Questionário criado com sucesso.",
-            "quiz": quiz_criado,
-            "perguntas": perguntas_salvas,
-            "total_perguntas": len(perguntas_salvas)
-        }, 201)
-
-    except Exception:
-        if quiz_id_criado:
-
-            try:
-                (
-                    db.table("quiz")
-                    .delete()
-                    .eq("id", quiz_id_criado)
-                    .eq("sala_id", sala_id)
-                    .execute()
-                )
-
-            except Exception:
-                app.logger.exception(
-                    "Falha ao desfazer a criação parcial do quiz."
-                )
-
-        app.logger.exception("Erro ao criar questionário.")
-
-        return _error(
-            "Não foi possível criar o questionário. Verifique os dados e tente novamente.",
-            500
-        )
 
 # =============================================================================
 # PROFESSOR — GERAÇÃO DE QUIZ COM GEMINI (não acessa dados de sala/aluno)
@@ -3764,6 +3723,61 @@ def entrar_sala_por_codigo(current_user):
         return _success({"message": f"Você entrou na sala '{sala['nome']}'!", "sala": sala}, 201)
     except Exception as e:
         return _error(str(e), 500)
+    
+@app.route("/api/aluno/quiz/<quiz_id>", methods=["GET"])
+@token_required
+def ver_quiz_aluno(current_user, quiz_id):
+    """
+    Permite ao aluno visualizar os detalhes de um quiz específico 
+    e suas respectivas perguntas para resolução (omitindo o gabarito).
+    """
+    db = get_user_supabase()
+    aluno_id = current_user["id"]
+
+    if not _uuid_valido(quiz_id):
+        return _error("ID do questionário inválido.", 400)
+
+    sala_id = _get_vinculo_aluno(db, aluno_id)
+    if not sala_id:
+        return _error("Você não está matriculado em nenhuma sala.", 403)
+
+    quiz_r = (
+        db.table("quiz")
+        .select("*")
+        .eq("id", quiz_id)
+        .eq("sala_id", sala_id)
+        .execute()
+    )
+    if not quiz_r.data:
+        return _error("Quiz não encontrado ou sem acesso.", 404)
+    
+    quiz = quiz_r.data[0]
+
+    progresso_r = (
+        db.table("quiz_progress")
+        .select("*")
+        .eq("aluno_id", aluno_id)
+        .eq("quiz_id", quiz_id)
+        .execute()
+    )
+    ja_respondido = bool(progresso_r.data)
+    progresso = progresso_r.data[0] if ja_respondido else None
+
+    perguntas_r = (
+        db.table("question")
+        .select("id, question, option_a, option_b, option_c, option_d, ordem")
+        .eq("quiz_id", quiz_id)
+        .order("ordem")
+        .execute()
+    )
+    perguntas = perguntas_r.data or []
+
+    return _success({
+        "quiz": quiz,
+        "perguntas": perguntas,
+        "ja_respondido": ja_respondido,
+        "progresso": progresso
+    })
 
 
 @app.route("/api/aluno/quiz/<quiz_id>/responder", methods=["POST"])
