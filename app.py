@@ -2151,23 +2151,47 @@ def corrigir_nota_individual(current_user, progresso_id):
 @token_required
 @professor_required
 def pauta(current_user, sala_id):
+    """
+    Pauta reescrita conforme as decisões da Maya (Decisões 1, 4, 6, 7):
+      - Fórmula oficial: média final = média_atividades × participação_atividades
+        + média_provas_ponderada × participação_provas (por período).
+      - Treino nunca entra em nenhuma média oficial (fica em media_treinos,
+        separado) — Decisão 2.
+      - Prova avaliativa sem resultado contável fica de fora do cálculo
+        (nunca vira zero sozinha) e marca media_provisoria=True — Decisão 4.
+      - Considera só a tentativa "vigente" de cada prova (ignora qualquer
+        tentativa com status='substituida') — Decisão 7.
+      - Continua lendo quiz_progress (histórico legado) só para o par
+        aluno/quiz que não tem nenhuma linha em quiz_tentativa, para não
+        perder notas de antes desta migração.
+    """
     db = get_user_supabase()
     if not _sala_do_professor(db, sala_id, current_user["id"]):
         return _error("Sala não encontrada ou sem permissão.", 404)
 
     periodo_id = request.args.get("periodo_id")
 
-    periodos = db.table("periodos").select("id, nome, meta_missoes").eq("sala_id", sala_id).order("criado_em").execute().data
+    periodos = (
+        db.table("periodos")
+        .select("id, nome, meta_missoes, participacao_atividades, participacao_provas")
+        .eq("sala_id", sala_id)
+        .order("criado_em")
+        .execute().data
+    )
+    participacao_idx = {p["id"]: p for p in periodos}
 
-    q_missoes = db.table("missoes").select("id, titulo, peso_nota, ordem").eq("sala_id", sala_id).eq("status", "publicada")
+    q_missoes = db.table("missoes").select("id, titulo, peso_nota, ordem, periodo_id").eq("sala_id", sala_id).eq("status", "publicada")
     if periodo_id:
         q_missoes = q_missoes.eq("periodo_id", periodo_id)
     missoes = q_missoes.order("ordem").execute().data
 
-    q_quiz = db.table("quiz").select("id, titulo, periodo_id").eq("sala_id", sala_id)
+    q_quiz = db.table("quiz").select("id, titulo, periodo_id, tipo, peso, publicado_em").eq("sala_id", sala_id)
     if periodo_id:
         q_quiz = q_quiz.eq("periodo_id", periodo_id)
     quizzes = q_quiz.order("criado_em").execute().data
+
+    quizzes_avaliativos = [q for q in quizzes if q.get("tipo", "avaliativo") == "avaliativo" and q.get("publicado_em")]
+    quizzes_treino = [q for q in quizzes if q.get("tipo") == "treino"]
 
     alunos_r = db.table("aluno_salas").select("perfis(id, nome)").eq("sala_id", sala_id).execute().data
     alunos = [item["perfis"] for item in alunos_r if item.get("perfis")]
@@ -2179,64 +2203,243 @@ def pauta(current_user, sala_id):
     )
 
     quiz_ids = [q["id"] for q in quizzes]
+
+    # Tentativas "vigentes" (nunca 'substituida') — a mais recente de cada
+    # aluno/quiz é a que vale (Decisão 7).
+    todas_tentativas = (
+        db.table("quiz_tentativa")
+        .select("aluno_id, quiz_id, status, nota, criado_em")
+        .in_("quiz_id", quiz_ids)
+        .neq("status", "substituida")
+        .order("criado_em", desc=True)
+        .execute().data
+        if quiz_ids else []
+    )
+    tentativa_vigente_idx = {}
+    for t in todas_tentativas:
+        chave = (t["aluno_id"], t["quiz_id"])
+        if chave not in tentativa_vigente_idx:  # já ordenado desc -> primeira é a mais recente
+            tentativa_vigente_idx[chave] = t
+
+    # Histórico legado: só para pares aluno/quiz sem nenhuma linha em
+    # quiz_tentativa (evita contar nota duas vezes).
     quiz_progressos = (
         db.table("quiz_progress")
-        .select("aluno_id, quiz_id, score, correct_answers, total_questions, is_late")
+        .select("aluno_id, quiz_id, score")
         .in_("quiz_id", quiz_ids)
         .execute().data
         if quiz_ids else []
     )
-    qprog_idx = {(qp["aluno_id"], qp["quiz_id"]): qp for qp in quiz_progressos}
+    qprog_idx = {
+        (qp["aluno_id"], qp["quiz_id"]): qp
+        for qp in quiz_progressos
+        if (qp["aluno_id"], qp["quiz_id"]) not in tentativa_vigente_idx
+    }
+
     aluno_equipe_map = _build_equipe_map_periodo(db, sala_id, periodo_id)
+
+    def _resultado_do_quiz(aluno_id, quiz_id):
+        """
+        Retorna (nota_0_a_10, contavel, pendente_de_decisao) para este
+        aluno/quiz:
+          - contavel=True  -> entra na média (finalizada, ou ausencia_justificada
+            com nota explícita atribuída pelo professor)
+          - contavel=False -> fora do cálculo
+          - pendente_de_decisao=True -> precisa de ação do professor,
+            torna a média do aluno "provisória" (Decisão 4)
+        """
+        chave = (aluno_id, quiz_id)
+        t = tentativa_vigente_idx.get(chave)
+        if t:
+            if t["status"] == "finalizada" and t.get("nota") is not None:
+                return round(t["nota"] / 10, 2), True, False
+            if t["status"] == "ausencia_justificada":
+                nota = t.get("nota")
+                if nota is not None:  # professor atribuiu zero explicitamente
+                    return round(nota / 10, 2), True, False
+                return None, False, False  # justificada sem nota: fora do cálculo, não é pendência
+            # em_andamento / expirada / pendente_incidente: ainda sem resultado
+            return None, False, True
+        qp = qprog_idx.get(chave)
+        if qp:
+            return round(qp["score"] / 10, 1), True, False
+        # Nenhuma tentativa em lugar nenhum: pendente (Decisão 4)
+        return None, False, True
+
+    def _participacao(periodo_id_do_item):
+        p = participacao_idx.get(periodo_id_do_item)
+        if not p:
+            return 70.0, 30.0  # fallback só se o período não for encontrado
+        return float(p["participacao_atividades"]), float(p["participacao_provas"])
 
     pauta_data = []
     for aluno in alunos:
         aid = aluno["id"]
+
+        # --- Atividades (missões), agrupadas por período -----------------
         notas = {}
-        soma_m, peso_m = 0.0, 0.0
+        soma_m_por_periodo = {}
+        peso_m_por_periodo = {}
         for m in missoes:
             prog = next((p for p in progressos if p["aluno_id"] == aid and p["missao_id"] == m["id"]), None)
             nota = prog["nota"] if prog and prog.get("nota") is not None else None
-            notas[m["id"]] = {
-                "nota": nota,
-                "nota_origem": prog.get("nota_origem") if prog else None,
-            }
+            notas[m["id"]] = {"nota": nota, "nota_origem": prog.get("nota_origem") if prog else None}
             if nota is not None:
                 peso = float(m.get("peso_nota") or 1)
-                soma_m += nota * peso
-                peso_m += peso
-        media_missoes = round(soma_m / peso_m, 2) if peso_m > 0 else None
+                pid = m.get("periodo_id")
+                soma_m_por_periodo[pid] = soma_m_por_periodo.get(pid, 0) + nota * peso
+                peso_m_por_periodo[pid] = peso_m_por_periodo.get(pid, 0) + peso
 
+        # --- Provas avaliativas, agrupadas por período --------------------
         quiz_notas = {}
-        soma_q, count_q = 0.0, 0
-        for q in quizzes:
-            qp = qprog_idx.get((aid, q["id"]))
-            nota_q = round(qp["score"] / 10, 1) if qp else None
-            quiz_notas[q["id"]] = nota_q
-            if nota_q is not None:
-                soma_q += nota_q
-                count_q += 1
-        media_quizzes = round(soma_q / count_q, 2) if count_q > 0 else None
+        soma_q_por_periodo = {}
+        peso_q_por_periodo = {}
+        algum_pendente = False
+        for q in quizzes_avaliativos:
+            nota_q, contavel, pendente = _resultado_do_quiz(aid, q["id"])
+            quiz_notas[q["id"]] = {"nota": nota_q, "pendente": pendente}
+            if pendente:
+                algum_pendente = True
+            if contavel and nota_q is not None:
+                peso = float(q.get("peso") or 1)
+                pid = q.get("periodo_id")
+                soma_q_por_periodo[pid] = soma_q_por_periodo.get(pid, 0) + nota_q * peso
+                peso_q_por_periodo[pid] = peso_q_por_periodo.get(pid, 0) + peso
 
-        partes = [x for x in [media_missoes, media_quizzes] if x is not None]
-        media_final = round(sum(partes) / len(partes), 2) if partes else None
+        # --- Treinos: nunca entram em média, só referência (Decisão 2) ----
+        treino_notas = {}
+        for q in quizzes_treino:
+            nota_t, _, _ = _resultado_do_quiz(aid, q["id"])
+            treino_notas[q["id"]] = nota_t
+        notas_treino_validas = [n for n in treino_notas.values() if n is not None]
+        media_treinos = (
+            round(sum(notas_treino_validas) / len(notas_treino_validas), 2)
+            if notas_treino_validas else None
+        )
+
+        # --- Combina por período usando a fórmula da Maya ------------------
+        todos_periodos_envolvidos = set(soma_m_por_periodo) | set(soma_q_por_periodo)
+        if periodo_id:
+            pid = periodo_id
+            media_m = (soma_m_por_periodo.get(pid, 0) / peso_m_por_periodo[pid]) if peso_m_por_periodo.get(pid) else None
+            media_q = (soma_q_por_periodo.get(pid, 0) / peso_q_por_periodo[pid]) if peso_q_por_periodo.get(pid) else None
+            part_ativ, part_provas = _participacao(pid)
+            media_final = _combinar_media_final(media_m, media_q, part_ativ, part_provas)
+        else:
+            # Pauta da sala inteira (vários períodos): média simples entre
+            # as médias finais de cada período com dado — evita combinar
+            # participações diferentes de períodos distintos numa só conta.
+            medias_finais_por_periodo = []
+            for pid in todos_periodos_envolvidos:
+                media_m = (soma_m_por_periodo.get(pid, 0) / peso_m_por_periodo[pid]) if peso_m_por_periodo.get(pid) else None
+                media_q = (soma_q_por_periodo.get(pid, 0) / peso_q_por_periodo[pid]) if peso_q_por_periodo.get(pid) else None
+                part_ativ, part_provas = _participacao(pid)
+                mf = _combinar_media_final(media_m, media_q, part_ativ, part_provas)
+                if mf is not None:
+                    medias_finais_por_periodo.append(mf)
+            media_final = (
+                round(sum(medias_finais_por_periodo) / len(medias_finais_por_periodo), 2)
+                if medias_finais_por_periodo else None
+            )
+
+        media_missoes_exib = (
+            round(sum(soma_m_por_periodo.values()) / sum(peso_m_por_periodo.values()), 2)
+            if peso_m_por_periodo and sum(peso_m_por_periodo.values()) > 0 else None
+        )
+        media_quizzes_exib = (
+            round(sum(soma_q_por_periodo.values()) / sum(peso_q_por_periodo.values()), 2)
+            if peso_q_por_periodo and sum(peso_q_por_periodo.values()) > 0 else None
+        )
 
         pauta_data.append({
             "aluno": aluno,
             "notas": notas,
             "quiz_notas": quiz_notas,
-            "media_missoes": media_missoes,
-            "media_quizzes": media_quizzes,
+            "treino_notas": treino_notas,
+            "media_missoes": media_missoes_exib,
+            "media_quizzes": media_quizzes_exib,
+            "media_treinos": media_treinos,
             "media": media_final,
+            "media_provisoria": algum_pendente,  # Decisão 4
             "equipe_nome": aluno_equipe_map.get(aid, "—"),
         })
 
     return _success({
         "pauta_data": pauta_data,
         "missoes": missoes,
-        "quizzes": quizzes,
+        "quizzes": quizzes_avaliativos,
+        "quizzes_treino": quizzes_treino,
         "periodos": periodos,
     })
+
+
+def _combinar_media_final(media_atividades, media_provas, participacao_atividades, participacao_provas):
+    """
+    Fórmula da Maya (Decisão 1):
+      média final = média_atividades × participação_atividades
+                  + média_provas × participação_provas
+    (participações em %, somando 100 — garantido por constraint no banco)
+
+    Se faltar uma das duas médias, usa só a parte disponível (evita que a
+    média despenque artificialmente só porque um grupo ainda não tem
+    nenhum lançamento).
+    """
+    pa = participacao_atividades / 100
+    pp = participacao_provas / 100
+
+    if media_atividades is not None and media_provas is not None:
+        return round(media_atividades * pa + media_provas * pp, 2)
+    if media_atividades is not None:
+        return round(media_atividades, 2)
+    if media_provas is not None:
+        return round(media_provas, 2)
+    return None
+
+
+@app.route("/api/professor/salas/<sala_id>/periodos/<periodo_id>/participacao", methods=["PATCH"])
+@token_required
+@professor_required
+def definir_participacao_periodo(current_user, sala_id, periodo_id):
+    """
+    Define a participação (%) de atividades e provas na média final deste
+    período (Decisão 1). Os dois valores precisam somar 100. Bloqueado
+    pelo banco (trigger) se já existir prova publicada neste período.
+    """
+    db = get_user_supabase()
+    if not _periodo_da_sala(db, periodo_id, sala_id, current_user["id"]):
+        return _error("Período não encontrado nesta sala.", 404)
+
+    body = request.get_json(silent=True) or {}
+    try:
+        part_ativ = float(body.get("participacao_atividades"))
+        part_provas = float(body.get("participacao_provas"))
+    except (TypeError, ValueError):
+        return _error("Informe participacao_atividades e participacao_provas como números.", 400)
+
+    if round(part_ativ + part_provas, 2) != 100:
+        return _error("A soma de participacao_atividades e participacao_provas precisa ser 100.", 400)
+    if part_ativ < 0 or part_provas < 0:
+        return _error("Os percentuais não podem ser negativos.", 400)
+
+    try:
+        upd = (
+            db.table("periodos")
+            .update({"participacao_atividades": part_ativ, "participacao_provas": part_provas})
+            .eq("id", periodo_id)
+            .eq("sala_id", sala_id)
+            .execute()
+        )
+        if not upd.data:
+            return _error("Não foi possível atualizar a participação.", 500)
+        return _success({"message": "Participação atualizada.", "periodo": upd.data[0]})
+    except Exception as e:
+        if "check_violation" in str(e).lower() or "participação" in str(e).lower():
+            return _error(
+                "Não é possível alterar a participação: já existe prova publicada neste período.",
+                409,
+            )
+        app.logger.exception("Erro ao definir participação do período.")
+        return _error("Não foi possível atualizar a participação. Tente novamente.", 500)
 
 
 # =============================================================================
@@ -2481,6 +2684,59 @@ def criar_quiz(current_user, sala_id):
     if not _uuid_valido(sticker_reward_id):
         return _error("ID do sticker de recompensa inválido.", 400)
 
+    # --- NOVO: tipo (treino | avaliativo) ---------------------------------
+    tipo = body.get("tipo", "avaliativo")
+    if not isinstance(tipo, str) or tipo.strip().lower() not in ("treino", "avaliativo"):
+        return _error("Tipo inválido. Utilize 'treino' ou 'avaliativo'.", 400)
+    tipo = tipo.strip().lower()
+
+    # --- NOVO: peso (peso individual desta prova dentro do grupo de provas) -
+    peso_raw = body.get("peso", 1)
+    try:
+        peso = float(peso_raw)
+    except (ValueError, TypeError):
+        return _error("O peso precisa ser um número.", 400)
+    if peso <= 0:
+        return _error("O peso precisa ser maior que zero.", 400)
+
+    # --- NOVO: duração opcional em minutos (None = sem limite) -------------
+    duracao_raw = body.get("duracao_minutos")
+    duracao_minutos = None
+    if duracao_raw not in (None, ""):
+        try:
+            duracao_minutos = int(duracao_raw)
+        except (ValueError, TypeError):
+            return _error("A duração precisa ser um número inteiro de minutos.", 400)
+        if duracao_minutos <= 0:
+            return _error("A duração precisa ser maior que zero.", 400)
+
+    # --- NOVO: encerrar ao sair da guia (Decisão 10: desativado por padrão) -
+    encerrar_ao_sair_guia = bool(body.get("encerrar_ao_sair_guia", False))
+
+    # --- NOVO: tentativas permitidas -----------------------------------------
+    # Decisão 6: treino = ilimitado (None); avaliativo = sempre 1 (uma nova
+    # tentativa de prova só nasce via autorização do professor).
+    if tipo == "treino":
+        tentativas_permitidas = None
+    else:
+        tentativas_permitidas = 1
+
+    # --- NOVO: política de revisão (Decisão 8: ao finalizar a própria tentativa)
+    politica_revisao = body.get("politica_revisao", "ao_finalizar")
+    if politica_revisao not in ("ao_finalizar", "apos_janela"):
+        return _error("Política de revisão inválida.", 400)
+
+    # --- NOVO: janela de aplicação opcional (Decisão 11) ---------------------
+    janela_abre_em = body.get("janela_abre_em") or None
+    janela_fecha_em = body.get("janela_fecha_em") or None
+    if janela_abre_em and janela_fecha_em:
+        inicio = _parse_dt(janela_abre_em)
+        fim = _parse_dt(janela_fecha_em)
+        if not inicio or not fim:
+            return _error("Datas de janela inválidas.", 400)
+        if fim <= inicio:
+            return _error("O fim da janela precisa ser depois do início.", 400)
+
     perguntas, erro_perguntas = _normalizar_perguntas_quiz(
         body.get("perguntas")
     )
@@ -2500,7 +2756,17 @@ def criar_quiz(current_user, sala_id):
             "xp_reward": xp_reward,
             "sticker_reward_id": sticker_reward_id,
             "periodo_id": periodo_id,
-            "missao_id": missao_id
+            "missao_id": missao_id,
+            # --- NOVO ---
+            "tipo": tipo,
+            "peso": peso,
+            "duracao_minutos": duracao_minutos,
+            "encerrar_ao_sair_guia": encerrar_ao_sair_guia,
+            "tentativas_permitidas": tentativas_permitidas,
+            "politica_revisao": politica_revisao,
+            "janela_abre_em": janela_abre_em,
+            "janela_fecha_em": janela_fecha_em,
+            "publicado_em": None,  # nasce em rascunho — publicar é ação separada
         }
 
         quiz_r = (
@@ -2899,7 +3165,7 @@ def excluir_quiz(current_user, sala_id, quiz_id):
         if not quiz_r.data:
             return _error("Questionário não encontrado nesta sala.", 404)
 
-        tentativas = (
+        tentativas_legado = (
             db.table("quiz_progress")
             .select("id")
             .eq("quiz_id", quiz_id)
@@ -2907,8 +3173,20 @@ def excluir_quiz(current_user, sala_id, quiz_id):
             .execute()
             .data
         )
+        # NOVO: também bloquear se já existir alguma linha no novo fluxo de
+        # tentativas (quiz_tentativa) — antes só checava o histórico legado
+        # quiz_progress, o que deixaria excluir um quiz com tentativas já
+        # registradas pelo novo fluxo.
+        tentativas_novo_fluxo = (
+            db.table("quiz_tentativa")
+            .select("id")
+            .eq("quiz_id", quiz_id)
+            .limit(1)
+            .execute()
+            .data
+        )
 
-        if tentativas:
+        if tentativas_legado or tentativas_novo_fluxo:
             return _error(
                 "Este questionário possui respostas registradas e não pode ser excluído. "
                 "O histórico dos alunos precisa ser preservado.",
@@ -2939,6 +3217,84 @@ def excluir_quiz(current_user, sala_id, quiz_id):
             "Ocorreu um erro ao excluir o questionário.",
             500
         )
+
+
+@app.route("/api/professor/salas/<sala_id>/quizzes/<quiz_id>/publicar", methods=["PATCH"])
+@token_required
+@professor_required
+def publicar_quiz(current_user, sala_id, quiz_id):
+    """
+    Publica (ou despublica) um quiz para a turma. Só um quiz publicado
+    aparece disponível para o aluno iniciar (Decisão/seção 02: "o professor
+    escolhe antes da publicação e vê claramente se aquele quiz entra na
+    média"). Despublicar só é permitido se ainda não houver nenhuma
+    tentativa registrada, mesma proteção já usada em excluir_quiz.
+    """
+    db = get_user_supabase()
+    professor_id = current_user["id"]
+
+    if not _uuid_valido(sala_id) or not _uuid_valido(quiz_id):
+        return _error("ID da sala ou do questionário inválido.", 400)
+
+    if not _sala_do_professor(db, sala_id, professor_id):
+        return _error("Sala não encontrada ou sem permissão.", 404)
+
+    body = request.get_json(silent=True) or {}
+    publicar = body.get("publicar", True)
+    if not isinstance(publicar, bool):
+        return _error("O campo 'publicar' precisa ser verdadeiro ou falso.", 400)
+
+    quiz_r = (
+        db.table("quiz")
+        .select("*")
+        .eq("id", quiz_id)
+        .eq("sala_id", sala_id)
+        .execute()
+    )
+    if not quiz_r.data:
+        return _error("Questionário não encontrado nesta sala.", 404)
+
+    perguntas = (
+        db.table("question").select("id").eq("quiz_id", quiz_id).execute().data or []
+    )
+    if publicar and not perguntas:
+        return _error("Não é possível publicar um questionário sem perguntas.", 400)
+
+    if not publicar:
+        tentativas = (
+            db.table("quiz_tentativa")
+            .select("id")
+            .eq("quiz_id", quiz_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if tentativas:
+            return _error(
+                "Este questionário já possui tentativas registradas e não pode ser despublicado.",
+                409,
+            )
+
+    try:
+        agora = datetime.now(timezone.utc).isoformat() if publicar else None
+        upd = (
+            db.table("quiz")
+            .update({"publicado_em": agora})
+            .eq("id", quiz_id)
+            .eq("sala_id", sala_id)
+            .execute()
+        )
+        if not upd.data:
+            return _error("Não foi possível atualizar a publicação.", 500)
+
+        return _success({
+            "message": "Questionário publicado." if publicar else "Questionário despublicado.",
+            "quiz": upd.data[0],
+        })
+
+    except Exception:
+        app.logger.exception("Erro ao publicar/despublicar questionário.")
+        return _error("Não foi possível atualizar a publicação. Tente novamente.", 500)
 
 
 @app.route("/api/professor/salas/<sala_id>/desempenho-consolidado", methods=["GET"])
@@ -4227,6 +4583,1358 @@ def gerar_convite_sala(current_user, sala_id):
         "codigo_acesso": codigo,
         "link_convite": link_convite
     })
+
+
+# =============================================================================
+# SEÇÃO NOVA — CICLO DE VIDA DA TENTATIVA DE PROVA (quiz_tentativa)
+# Adicionado conforme AstroLearn-Pendencias-Quizzes-Yan.pdf e as decisões
+# respondidas pela Maya. Não altera nem remove nenhuma rota legada acima
+# (responder_quiz, ver_quiz_aluno, quiz_progress continuam intactas).
+# =============================================================================
+# =============================================================================
+# ALUNO — CICLO DE VIDA DA TENTATIVA DE PROVA (quiz_tentativa)
+#
+# Substitui o fluxo "tudo de uma vez" de responder_quiz/ver_quiz_aluno para
+# quizzes do tipo 'avaliativo' com controle de tempo/guia. Mantém
+# responder_quiz/ver_quiz_aluno e quiz_progress intactos (histórico legado).
+#
+# ✅ Atualizado com as respostas da Maya (ver AstroLearn-Pendencias-Quizzes-
+#    Yan + documento de decisões respondido):
+#     - Avaliativo: 1 tentativa; nova tentativa só via autorização do
+#       professor (POST .../autorizar-nova-tentativa, em patch_decisoes_maya.py)
+#     - Treino: tentativas ilimitadas (quiz.tentativas_permitidas = NULL)
+#     - Revisão liberada ao finalizar a PRÓPRIA tentativa (ao_finalizar) — confirmado
+#     - Prova sem nota conta como "sem nota" (fora do cálculo), nunca zero;
+#       o professor decide depois (zero / justificar / nova tentativa) —
+#       ver patch_decisoes_maya.py
+#     - Expiração tratada em código (sem pg_cron) — ver _expirar_se_vencida — confirmado
+# =============================================================================
+import secrets
+
+
+# -----------------------------------------------------------------------------
+# HELPERS DE NEGÓCIO — CAMADA 2 (posse/estado), além do RLS
+# -----------------------------------------------------------------------------
+def _quiz_da_sala_aluno(db, quiz_id, aluno_id):
+    """
+    Retorna o quiz (com todas as colunas novas) se o aluno estiver
+    matriculado na sala dele, senão None. Centraliza a checagem de posse
+    para todas as rotas de tentativa abaixo.
+    """
+    sala_id = _get_vinculo_aluno(db, aluno_id)
+    if not sala_id:
+        return None, None
+    quiz_r = (
+        db.table("quiz")
+        .select("*")
+        .eq("id", quiz_id)
+        .eq("sala_id", sala_id)
+        .execute()
+    )
+    if not quiz_r.data:
+        return None, None
+    return quiz_r.data[0], sala_id
+
+
+def _tentativa_do_aluno(db, tentativa_id, aluno_id):
+    """
+    Busca uma quiz_tentativa garantindo que pertence ao aluno autenticado.
+    Embutido: dados do quiz (para checar duracao_minutos, janela, etc.).
+    """
+    r = (
+        db.table("quiz_tentativa")
+        .select("*, quiz(*)")
+        .eq("id", tentativa_id)
+        .eq("aluno_id", aluno_id)
+        .execute()
+    )
+    return r.data[0] if r.data else None
+
+
+def _calcular_expires_at(quiz, iniciado_em_dt):
+    """
+    expires_at = iniciado_em + duracao_minutos (se houver).
+    Se o quiz tiver janela_fecha_em, o vencimento real é o MENOR entre os
+    dois (regra da seção 03 do relatório). NULL = sem limite de tempo.
+    """
+    candidatos = []
+    duracao = quiz.get("duracao_minutos")
+    if duracao:
+        from datetime import timedelta
+        candidatos.append(iniciado_em_dt + timedelta(minutes=duracao))
+
+    janela_fecha = _parse_dt(quiz.get("janela_fecha_em"))
+    if janela_fecha:
+        candidatos.append(janela_fecha)
+
+    if not candidatos:
+        return None
+    return min(candidatos)
+
+
+def _corrigir_itens_servidor(db, tentativa_id, quiz_id):
+    """
+    Recalcula, a partir de quiz_resposta_item + question (gabarito), os
+    agregados de uma tentativa: acertos, erros, em_branco, nota (0-100).
+    Sempre lido do servidor — nunca aceitar nota/acertos vindos do cliente
+    (seção 05: "Cronômetro e correção no servidor").
+
+    Retorna dict: {"acertos":.., "erros":.., "em_branco":.., "nota":.., "total":..}
+    """
+    perguntas = (
+        db.table("question")
+        .select("id, correct_answer")
+        .eq("quiz_id", quiz_id)
+        .execute().data or []
+    )
+    total = len(perguntas)
+    if total == 0:
+        return {"acertos": 0, "erros": 0, "em_branco": 0, "nota": 0.0, "total": 0}
+
+    gabarito = {p["id"]: str(p.get("correct_answer") or "").strip().lower() for p in perguntas}
+
+    respostas = (
+        db.table("quiz_resposta_item")
+        .select("question_id, alternativa_marcada")
+        .eq("tentativa_id", tentativa_id)
+        .execute().data or []
+    )
+    respondidas = {r["question_id"]: r.get("alternativa_marcada") for r in respostas}
+
+    acertos = 0
+    em_branco = 0
+    for qid, correta in gabarito.items():
+        marcada = respondidas.get(qid)
+        if not marcada:
+            em_branco += 1
+        elif str(marcada).strip().lower() == correta:
+            acertos += 1
+
+    erros = total - acertos - em_branco
+    nota = round((acertos / total) * 100, 2) if total > 0 else 0.0
+
+    return {"acertos": acertos, "erros": erros, "em_branco": em_branco, "nota": nota, "total": total}
+
+
+def _marcar_itens_corretos(db, tentativa_id, quiz_id):
+    """
+    Atualiza quiz_resposta_item.correta/pontuacao para cada item já
+    gravado, com base no gabarito — usado na finalização, para a revisão
+    por item do aluno e a análise por questão do professor (seção 04).
+    """
+    perguntas = (
+        db.table("question")
+        .select("id, correct_answer")
+        .eq("quiz_id", quiz_id)
+        .execute().data or []
+    )
+    gabarito = {p["id"]: str(p.get("correct_answer") or "").strip().lower() for p in perguntas}
+
+    respostas = (
+        db.table("quiz_resposta_item")
+        .select("id, question_id, alternativa_marcada")
+        .eq("tentativa_id", tentativa_id)
+        .execute().data or []
+    )
+    for r in respostas:
+        correta_gabarito = gabarito.get(r["question_id"])
+        marcada = str(r.get("alternativa_marcada") or "").strip().lower() or None
+        correta = bool(marcada and correta_gabarito and marcada == correta_gabarito)
+        db.table("quiz_resposta_item").update({
+            "correta": correta,
+            "pontuacao": 1 if correta else 0,
+        }).eq("id", r["id"]).execute()
+
+
+def _finalizar_tentativa(db, tentativa, motivo):
+    """
+    Finalização ATÔMICA e IDEMPOTENTE (seção 05 do relatório):
+      - Se já estiver 'finalizada', retorna o estado atual sem reprocessar
+        (requisições repetidas, vencimento e envio simultâneo => 1 resultado).
+      - Corrige no servidor, grava agregados em quiz_tentativa e marca cada
+        item com correta/pontuacao.
+      - O UPDATE com .eq("status", "em_andamento") funciona como trava:
+        se duas requisições chegarem "ao mesmo tempo", só uma delas
+        encontra a linha ainda em_andamento e grava; a outra recebe 0 linhas
+        afetadas e cai no fallback de releitura abaixo.
+    """
+    if tentativa["status"] == "finalizada":
+        return tentativa, False  # já finalizada — idempotente, nada a fazer
+
+    quiz_id = tentativa["quiz_id"]
+    tentativa_id = tentativa["id"]
+
+    resultado = _corrigir_itens_servidor(db, tentativa_id, quiz_id)
+
+    upd = (
+        db.table("quiz_tentativa")
+        .update({
+            "status": "finalizada",
+            "finalizado_em": datetime.now(timezone.utc).isoformat(),
+            "motivo_encerramento": motivo,
+            "nota": resultado["nota"],
+            "acertos": resultado["acertos"],
+            "erros": resultado["erros"],
+            "em_branco": resultado["em_branco"],
+        })
+        .eq("id", tentativa_id)
+        .eq("status", "em_andamento")  # trava de concorrência
+        .execute()
+    )
+
+    if not upd.data:
+        # Outra requisição já finalizou primeiro — relê o estado definitivo.
+        releitura = db.table("quiz_tentativa").select("*").eq("id", tentativa_id).execute()
+        return (releitura.data[0] if releitura.data else tentativa), False
+
+    _marcar_itens_corretos(db, tentativa_id, quiz_id)
+
+    tentativa_final = upd.data[0]
+    return tentativa_final, True
+
+
+def _expirar_se_vencida(db, tentativa):
+    """
+    Checagem de expiração "sob demanda": toda rota que lê ou escreve uma
+    tentativa chama isto primeiro. Se o relógio do SERVIDOR já passou de
+    expires_at e a tentativa ainda está em_andamento, finaliza agora com
+    motivo_encerramento='tempo_esgotado', usando o que já estiver salvo
+    (itens respondidos até então) — nunca depende do navegador do aluno
+    estar aberto (seção 03: "mesmo se a guia estiver fechada").
+
+    Decisão de arquitetura (sem pg_cron, por escolha do time): não existe
+    um job de fundo rodando sozinho; a expiração é "preguiçosa" e dispara
+    no primeiro acesso de QUALQUER parte (aluno OU professor) após o
+    vencimento. Isso cobre a dashboard do professor (que lista tentativas)
+    e qualquer rota do aluno, então a janela sem consolidação é pequena,
+    mas não é zero em teoria (prova sem nenhum acesso após expirar só
+    consolida no próximo acesso). Se isso virar um problema em produção,
+    promover para pg_cron é uma troca pequena — a lógica de finalização
+    já está isolada em _finalizar_tentativa.
+    """
+    if tentativa["status"] != "em_andamento":
+        return tentativa
+
+    expires_at = _parse_dt(tentativa.get("expires_at"))
+    if not expires_at:
+        return tentativa  # sem limite de tempo
+
+    if datetime.now(timezone.utc) >= expires_at:
+        tentativa_final, _ = _finalizar_tentativa(db, tentativa, "tempo_esgotado")
+        return tentativa_final
+
+    return tentativa
+
+
+def _serializar_tentativa_aluno(tentativa, incluir_gabarito=False):
+    """
+    Remove campos sensíveis do servidor que o aluno não deve enxergar
+    enquanto a tentativa está em_andamento. incluir_gabarito só deve ser
+    True depois de finalizada (chamado pela rota de revisão).
+    """
+    base = {
+        "id": tentativa["id"],
+        "quiz_id": tentativa["quiz_id"],
+        "status": tentativa["status"],
+        "numero_tentativa": tentativa["numero_tentativa"],
+        "iniciado_em": tentativa["iniciado_em"],
+        "expires_at": tentativa.get("expires_at"),
+        "finalizado_em": tentativa.get("finalizado_em"),
+        "motivo_encerramento": tentativa.get("motivo_encerramento"),
+    }
+    if incluir_gabarito and tentativa["status"] == "finalizada":
+        base.update({
+            "nota": tentativa.get("nota"),
+            "acertos": tentativa.get("acertos"),
+            "erros": tentativa.get("erros"),
+            "em_branco": tentativa.get("em_branco"),
+        })
+    return base
+
+
+# -----------------------------------------------------------------------------
+# GET /api/aluno/quiz/<quiz_id>/tentativa
+# Estado atual do aluno nesta prova: nunca iniciou / em andamento / finalizada.
+# Tela de "antes de começar" (seção 03) usa isto para decidir o que mostrar.
+# -----------------------------------------------------------------------------
+@app.route("/api/aluno/quiz/<quiz_id>/tentativa", methods=["GET"])
+@token_required
+def ver_estado_tentativa_quiz(current_user, quiz_id):
+    db = get_user_supabase()
+    aluno_id = current_user["id"]
+
+    if not _uuid_valido(quiz_id):
+        return _error("ID do questionário inválido.", 400)
+
+    quiz, _ = _quiz_da_sala_aluno(db, quiz_id, aluno_id)
+    if not quiz:
+        return _error("Quiz não encontrado ou sem acesso.", 404)
+
+    if not quiz.get("publicado_em"):
+        return _error("Esta prova ainda não foi publicada pelo professor.", 403)
+
+    tentativas_r = (
+        db.table("quiz_tentativa")
+        .select("*")
+        .eq("aluno_id", aluno_id)
+        .eq("quiz_id", quiz_id)
+        .order("numero_tentativa", desc=True)
+        .execute()
+    )
+    tentativas = tentativas_r.data or []
+
+    tentativa_ativa = next((t for t in tentativas if t["status"] == "em_andamento"), None)
+    if tentativa_ativa:
+        tentativa_ativa = _expirar_se_vencida(db, tentativa_ativa)
+
+    finalizadas = [t for t in tentativas if t["status"] == "finalizada"]
+    pode_iniciar_nova = len(tentativas) < quiz.get("tentativas_permitidas", 1)
+
+    return _success({
+        "quiz": {
+            "id": quiz["id"],
+            "titulo": quiz["titulo"],
+            "tipo": quiz["tipo"],
+            "duracao_minutos": quiz.get("duracao_minutos"),
+            "encerrar_ao_sair_guia": quiz.get("encerrar_ao_sair_guia"),
+            "tentativas_permitidas": quiz.get("tentativas_permitidas", 1),
+        },
+        "tentativa_em_andamento": (
+            _serializar_tentativa_aluno(tentativa_ativa) if tentativa_ativa else None
+        ),
+        "tentativas_finalizadas": [
+            _serializar_tentativa_aluno(t, incluir_gabarito=True) for t in finalizadas
+        ],
+        "pode_iniciar_nova": pode_iniciar_nova and tentativa_ativa is None,
+    })
+
+
+# -----------------------------------------------------------------------------
+# POST /api/aluno/quiz/<quiz_id>/iniciar
+# Ação explícita "Iniciar prova" (seção 03): só aqui o cronômetro começa.
+# Abrir a tela de detalhes (rota acima) NÃO inicia nada.
+# -----------------------------------------------------------------------------
+@app.route("/api/aluno/quiz/<quiz_id>/iniciar", methods=["POST"])
+@token_required
+def iniciar_tentativa_quiz(current_user, quiz_id):
+    db = get_user_supabase()
+    aluno_id = current_user["id"]
+
+    if not _uuid_valido(quiz_id):
+        return _error("ID do questionário inválido.", 400)
+
+    quiz, sala_id = _quiz_da_sala_aluno(db, quiz_id, aluno_id)
+    if not quiz:
+        return _error("Quiz não encontrado ou sem acesso.", 404)
+
+    if not quiz.get("publicado_em"):
+        return _error("Esta prova ainda não foi publicada pelo professor.", 403)
+
+    agora = datetime.now(timezone.utc)
+
+    # Janela de aplicação, se definida (seção 03 — proposta adicional)
+    janela_abre = _parse_dt(quiz.get("janela_abre_em"))
+    janela_fecha = _parse_dt(quiz.get("janela_fecha_em"))
+    if janela_abre and agora < janela_abre:
+        return _error("Esta prova ainda não está disponível para início.", 403)
+    if janela_fecha and agora >= janela_fecha:
+        return _error("O prazo para iniciar esta prova já encerrou.", 403)
+
+    perguntas = (
+        db.table("question").select("id").eq("quiz_id", quiz_id).execute().data or []
+    )
+    if not perguntas:
+        return _error("Este quiz não possui perguntas.", 400)
+
+    # Já existe tentativa ativa? (o índice único parcial do banco também
+    # protege contra concorrência; esta checagem só dá uma mensagem melhor)
+    existentes_r = (
+        db.table("quiz_tentativa")
+        .select("*")
+        .eq("aluno_id", aluno_id)
+        .eq("quiz_id", quiz_id)
+        .execute()
+    )
+    existentes = existentes_r.data or []
+
+    ativa = next((t for t in existentes if t["status"] == "em_andamento"), None)
+    if ativa:
+        ativa = _expirar_se_vencida(db, ativa)
+        if ativa["status"] == "em_andamento":
+            # Retoma a mesma tentativa: "ao recarregar, recuperar a mesma
+            # tentativa... não gerar nova tentativa" (seção 03)
+            return _success({
+                "message": "Você já tem uma tentativa em andamento. Continuando de onde parou.",
+                "tentativa": _serializar_tentativa_aluno(ativa),
+                "retomada": True,
+            })
+
+    # --- Decisão 6/7 da Maya -------------------------------------------
+    # Treino: tentativas_permitidas é NULL = ilimitado, aluno sempre pode
+    # iniciar outra (cada tentativa de treino nasce independente).
+    #
+    # Avaliativo: tentativas_permitidas é sempre 1 aqui (backfill da
+    # migração parte 3). Uma vez que o aluno tenha QUALQUER tentativa que
+    # não seja 'substituida' (finalizada, expirada, ausência justificada,
+    # pendente de incidente...), o autoatendimento para — uma tentativa
+    # nova só nasce via POST .../autorizar-nova-tentativa do professor.
+    # Isso é diferente de "limite numérico": mesmo com tentativas_permitidas
+    # alto, o aluno NUNCA inicia uma 2ª tentativa de prova sozinho.
+    limite = quiz.get("tentativas_permitidas")
+    usadas_nao_substituidas = [t for t in existentes if t["status"] != "substituida"]
+
+    if limite is not None and usadas_nao_substituidas:
+        if quiz.get("tipo") == "avaliativo":
+            return _error(
+                "Você já utilizou sua tentativa nesta prova. Uma nova tentativa "
+                "só pode ser autorizada pelo professor responsável.",
+                409,
+            )
+        if len(usadas_nao_substituidas) >= limite:
+            return _error(
+                f"Você já utilizou todas as tentativas permitidas nesta prova ({limite}).",
+                409,
+            )
+
+    finalizadas = [t for t in existentes if t["status"] in ("finalizada", "ausencia_justificada")]
+    expires_at = _calcular_expires_at(quiz, agora)
+
+    try:
+        nova_r = (
+            db.table("quiz_tentativa")
+            .insert({
+                "aluno_id": aluno_id,
+                "quiz_id": quiz_id,
+                "numero_tentativa": len(finalizadas) + 1,
+                "status": "em_andamento",
+                "iniciado_em": agora.isoformat(),
+                "expires_at": expires_at.isoformat() if expires_at else None,
+                "ultima_gravacao_em": agora.isoformat(),
+            })
+            .execute()
+        )
+        if not nova_r.data:
+            raise RuntimeError("O banco não retornou a tentativa criada.")
+
+        return _success({
+            "message": "Prova iniciada. Boa sorte!",
+            "tentativa": _serializar_tentativa_aluno(nova_r.data[0]),
+            "retomada": False,
+        }, 201)
+
+    except Exception as e:
+        # Colisão mais provável: índice único parcial (2 guias simultâneas
+        # tentando iniciar ao mesmo tempo) — devolve mensagem amigável.
+        if "uq_quiz_tentativa_ativa" in str(e).lower() or "duplicate" in str(e).lower():
+            return _error("Você já tem uma tentativa em andamento nesta prova.", 409)
+        app.logger.exception("Erro ao iniciar tentativa de quiz.")
+        return _error("Não foi possível iniciar a prova. Tente novamente.", 500)
+
+
+# -----------------------------------------------------------------------------
+# GET /api/aluno/quiz-tentativa/<tentativa_id>
+# Tela de realização da prova: perguntas (sem gabarito) + respostas já salvas.
+# -----------------------------------------------------------------------------
+@app.route("/api/aluno/quiz-tentativa/<tentativa_id>", methods=["GET"])
+@token_required
+def ver_tentativa_em_andamento(current_user, tentativa_id):
+    db = get_user_supabase()
+    aluno_id = current_user["id"]
+
+    if not _uuid_valido(tentativa_id):
+        return _error("ID da tentativa inválido.", 400)
+
+    tentativa = _tentativa_do_aluno(db, tentativa_id, aluno_id)
+    if not tentativa:
+        return _error("Tentativa não encontrada ou sem acesso.", 404)
+
+    tentativa = _expirar_se_vencida(db, tentativa)
+
+    perguntas = (
+        db.table("question")
+        .select("id, question, option_a, option_b, option_c, option_d, ordem")
+        .eq("quiz_id", tentativa["quiz_id"])
+        .order("ordem")
+        .execute().data or []
+    )
+
+    respostas_salvas = (
+        db.table("quiz_resposta_item")
+        .select("question_id, alternativa_marcada, salvo_em")
+        .eq("tentativa_id", tentativa_id)
+        .execute().data or []
+    )
+    respostas_idx = {r["question_id"]: r for r in respostas_salvas}
+
+    # Nunca expor correct_answer aqui — gabarito só na revisão pós-finalização
+    perguntas_sem_gabarito = []
+    for p in perguntas:
+        resp = respostas_idx.get(p["id"])
+        perguntas_sem_gabarito.append({
+            **p,
+            "alternativa_marcada": resp["alternativa_marcada"] if resp else None,
+            "salvo_em": resp["salvo_em"] if resp else None,
+        })
+
+    return _success({
+        "tentativa": _serializar_tentativa_aluno(tentativa),
+        "perguntas": perguntas_sem_gabarito,
+        "total_respondidas": sum(1 for r in respostas_salvas if r.get("alternativa_marcada")),
+        "total_perguntas": len(perguntas),
+    })
+
+
+# -----------------------------------------------------------------------------
+# PATCH /api/aluno/quiz-tentativa/<tentativa_id>/item
+# Salva UMA resposta por vez — não depende do envio final (seção 03).
+# Idempotente: reenviar a mesma pergunta só atualiza a alternativa marcada.
+# -----------------------------------------------------------------------------
+@app.route("/api/aluno/quiz-tentativa/<tentativa_id>/item", methods=["PATCH"])
+@token_required
+def salvar_item_tentativa(current_user, tentativa_id):
+    db = get_user_supabase()
+    aluno_id = current_user["id"]
+
+    if not _uuid_valido(tentativa_id):
+        return _error("ID da tentativa inválido.", 400)
+
+    tentativa = _tentativa_do_aluno(db, tentativa_id, aluno_id)
+    if not tentativa:
+        return _error("Tentativa não encontrada ou sem acesso.", 404)
+
+    tentativa = _expirar_se_vencida(db, tentativa)
+    if tentativa["status"] != "em_andamento":
+        return _error(
+            "Esta tentativa já foi encerrada. Novas respostas não são aceitas.",
+            409,
+        )
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return _error("Envie os dados em formato JSON.", 400)
+
+    question_id = body.get("question_id")
+    if not _uuid_valido(question_id) or not question_id:
+        return _error("ID da pergunta inválido.", 400)
+
+    alternativa = body.get("alternativa_marcada")
+    # None/"" = item em branco (o aluno pode desmarcar uma resposta)
+    if alternativa is not None:
+        alternativa = str(alternativa).strip().lower()
+        if alternativa not in ("a", "b", "c", "d", ""):
+            return _error("Alternativa inválida. Use a, b, c, d ou vazio.", 400)
+        if alternativa == "":
+            alternativa = None
+
+    pergunta_r = (
+        db.table("question")
+        .select("id")
+        .eq("id", question_id)
+        .eq("quiz_id", tentativa["quiz_id"])
+        .execute()
+    )
+    if not pergunta_r.data:
+        return _error("Esta pergunta não pertence a esta prova.", 404)
+
+    agora = datetime.now(timezone.utc).isoformat()
+    try:
+        # upsert manual (a tabela tem UNIQUE(tentativa_id, question_id))
+        existente_r = (
+            db.table("quiz_resposta_item")
+            .select("id")
+            .eq("tentativa_id", tentativa_id)
+            .eq("question_id", question_id)
+            .execute()
+        )
+        if existente_r.data:
+            item_r = (
+                db.table("quiz_resposta_item")
+                .update({"alternativa_marcada": alternativa, "atualizado_em": agora})
+                .eq("id", existente_r.data[0]["id"])
+                .execute()
+            )
+        else:
+            item_r = (
+                db.table("quiz_resposta_item")
+                .insert({
+                    "tentativa_id": tentativa_id,
+                    "question_id": question_id,
+                    "alternativa_marcada": alternativa,
+                    "salvo_em": agora,
+                    "atualizado_em": agora,
+                })
+                .execute()
+            )
+
+        if not item_r.data:
+            raise RuntimeError("O banco não confirmou o salvamento do item.")
+
+        db.table("quiz_tentativa").update({"ultima_gravacao_em": agora}).eq("id", tentativa_id).execute()
+
+        return _success({
+            "message": "Resposta salva.",
+            "question_id": question_id,
+            "alternativa_marcada": alternativa,
+            "salvo_em": agora,
+        })
+
+    except Exception:
+        app.logger.exception("Erro ao salvar item de resposta.")
+        return _error("Não foi possível salvar esta resposta. Tente novamente.", 500)
+
+
+# -----------------------------------------------------------------------------
+# POST /api/aluno/quiz-tentativa/<tentativa_id>/ocorrencia
+# Evento técnico vindo do front (visibilitychange, blur, offline/reconexão).
+# Nunca trata o evento como prova de fraude (seção 04/05).
+# -----------------------------------------------------------------------------
+@app.route("/api/aluno/quiz-tentativa/<tentativa_id>/ocorrencia", methods=["POST"])
+@token_required
+def registrar_ocorrencia_tentativa(current_user, tentativa_id):
+    db = get_user_supabase()
+    aluno_id = current_user["id"]
+
+    if not _uuid_valido(tentativa_id):
+        return _error("ID da tentativa inválido.", 400)
+
+    tentativa = _tentativa_do_aluno(db, tentativa_id, aluno_id)
+    if not tentativa:
+        return _error("Tentativa não encontrada ou sem acesso.", 404)
+
+    body = request.get_json(silent=True) or {}
+    tipo_evento = (body.get("tipo_evento") or "").strip()
+    if not tipo_evento:
+        return _error("Informe o tipo do evento.", 400)
+
+    horario_dispositivo = _parse_dt(body.get("horario_dispositivo"))
+    quiz = tentativa.get("quiz") or {}
+
+    tentativa_atual = _expirar_se_vencida(db, tentativa)
+
+    decisao = "aviso_registrado"
+    if (
+        tentativa_atual["status"] == "em_andamento"
+        and quiz.get("encerrar_ao_sair_guia")
+        and tipo_evento == "visibilitychange"
+    ):
+        # Regra: página oculta + encerrar_ao_sair_guia ativo => encerra já.
+        # "Um evento blur isolado não deve ser usado como prova de troca de
+        # guia" (seção 05) — por isso só 'visibilitychange' encerra aqui;
+        # 'blur' e outros tipos só ficam registrados como aviso.
+        _finalizar_tentativa(db, tentativa_atual, "saida_guia")
+        decisao = "tentativa_encerrada"
+
+    try:
+        db.table("quiz_ocorrencia").insert({
+            "tentativa_id": tentativa_id,
+            "tipo_evento": tipo_evento,
+            "horario_dispositivo": horario_dispositivo.isoformat() if horario_dispositivo else None,
+            "decisao_aplicada": decisao,
+            "detalhes": body.get("detalhes"),
+        }).execute()
+    except Exception:
+        app.logger.exception("Erro ao registrar ocorrência de tentativa.")
+        # Não falha a requisição por causa do log de ocorrência — mas o
+        # encerramento (se houve) já foi aplicado acima.
+
+    return _success({"decisao_aplicada": decisao})
+
+
+# -----------------------------------------------------------------------------
+# POST /api/aluno/quiz-tentativa/<tentativa_id>/finalizar
+# Envio voluntário do aluno. Idempotente: reenviar não duplica nem recalcula
+# diferente (seção 05).
+# -----------------------------------------------------------------------------
+@app.route("/api/aluno/quiz-tentativa/<tentativa_id>/finalizar", methods=["POST"])
+@token_required
+def finalizar_tentativa_aluno(current_user, tentativa_id):
+    db = get_user_supabase()
+    aluno_id = current_user["id"]
+
+    if not _uuid_valido(tentativa_id):
+        return _error("ID da tentativa inválido.", 400)
+
+    tentativa = _tentativa_do_aluno(db, tentativa_id, aluno_id)
+    if not tentativa:
+        return _error("Tentativa não encontrada ou sem acesso.", 404)
+
+    tentativa = _expirar_se_vencida(db, tentativa)
+
+    tentativa_final, foi_finalizada_agora = _finalizar_tentativa(db, tentativa, "envio_aluno")
+
+    mensagem = (
+        f"Prova concluída! Você acertou {tentativa_final.get('acertos', 0)}/"
+        f"{tentativa_final.get('acertos', 0) + tentativa_final.get('erros', 0) + tentativa_final.get('em_branco', 0)}."
+        if foi_finalizada_agora else
+        "Esta tentativa já havia sido finalizada."
+    )
+
+    return _success({
+        "message": mensagem,
+        "tentativa": _serializar_tentativa_aluno(tentativa_final, incluir_gabarito=True),
+    })
+
+
+# -----------------------------------------------------------------------------
+# GET /api/aluno/quiz-tentativa/<tentativa_id>/revisao
+# Gabarito completo — só depois de finalizada. Antes disso, 409 (nada de
+# "resultado parcial" — seção 03: "nenhuma consulta deve entregar gabarito
+# ou resultado parcial" antes da conclusão confirmada pelo servidor).
+# -----------------------------------------------------------------------------
+@app.route("/api/aluno/quiz-tentativa/<tentativa_id>/revisao", methods=["GET"])
+@token_required
+def ver_revisao_tentativa(current_user, tentativa_id):
+    db = get_user_supabase()
+    aluno_id = current_user["id"]
+
+    if not _uuid_valido(tentativa_id):
+        return _error("ID da tentativa inválido.", 400)
+
+    tentativa = _tentativa_do_aluno(db, tentativa_id, aluno_id)
+    if not tentativa:
+        return _error("Tentativa não encontrada ou sem acesso.", 404)
+
+    tentativa = _expirar_se_vencida(db, tentativa)
+
+    if tentativa["status"] != "finalizada":
+        return _error(
+            "A revisão só fica disponível depois que a tentativa é finalizada.",
+            409,
+        )
+
+    perguntas = (
+        db.table("question")
+        .select("id, question, option_a, option_b, option_c, option_d, correct_answer, ordem")
+        .eq("quiz_id", tentativa["quiz_id"])
+        .order("ordem")
+        .execute().data or []
+    )
+
+    respostas = (
+        db.table("quiz_resposta_item")
+        .select("question_id, alternativa_marcada, correta")
+        .eq("tentativa_id", tentativa_id)
+        .execute().data or []
+    )
+    respostas_idx = {r["question_id"]: r for r in respostas}
+
+    revisao = []
+    for p in perguntas:
+        resp = respostas_idx.get(p["id"])
+        revisao.append({
+            "question_id": p["id"],
+            "enunciado": p["question"],
+            "opcoes": {
+                "a": p["option_a"], "b": p["option_b"],
+                "c": p["option_c"], "d": p["option_d"],
+            },
+            "alternativa_marcada": resp["alternativa_marcada"] if resp else None,
+            "correta_gabarito": p["correct_answer"],
+            "acertou": bool(resp and resp.get("correta")),
+            "ordem": p["ordem"],
+        })
+
+    return _success({
+        "tentativa": _serializar_tentativa_aluno(tentativa, incluir_gabarito=True),
+        "revisao": revisao,
+    })
+
+# =============================================================================
+# PROFESSOR — CONSULTA E ANÁLISE DE TENTATIVAS (quiz_tentativa)
+# =============================================================================
+
+
+def _quiz_do_professor(db, quiz_id, professor_id):
+    """Retorna o quiz se pertencer a uma sala do professor, senão None."""
+    quiz_r = db.table("quiz").select("*").eq("id", quiz_id).execute()
+    if not quiz_r.data:
+        return None
+    quiz = quiz_r.data[0]
+    if not _sala_do_professor(db, quiz["sala_id"], professor_id):
+        return None
+    return quiz
+
+
+# -----------------------------------------------------------------------------
+# GET /api/professor/quiz/<quiz_id>/tentativas
+# Visão da turma: quem iniciou, quem concluiu, quem está pendente.
+# "Avaliações da turma por semestre; quantidade de alunos, tentativas
+# iniciadas, concluídas e pendentes" (seção 02 — dashboard do professor)
+# -----------------------------------------------------------------------------
+@app.route("/api/professor/quiz/<quiz_id>/tentativas", methods=["GET"])
+@token_required
+@professor_required
+def listar_tentativas_quiz(current_user, quiz_id):
+    db = get_user_supabase()
+
+    if not _uuid_valido(quiz_id):
+        return _error("ID do questionário inválido.", 400)
+
+    quiz = _quiz_do_professor(db, quiz_id, current_user["id"])
+    if not quiz:
+        return _error("Quiz não encontrado ou sem permissão.", 404)
+
+    alunos_r = (
+        db.table("aluno_salas")
+        .select("perfis(id, nome)")
+        .eq("sala_id", quiz["sala_id"])
+        .execute()
+    )
+    alunos = [item["perfis"] for item in (alunos_r.data or []) if item.get("perfis")]
+
+    tentativas_r = (
+        db.table("quiz_tentativa")
+        .select("*")
+        .eq("quiz_id", quiz_id)
+        .order("iniciado_em", desc=True)
+        .execute()
+    )
+    tentativas = tentativas_r.data or []
+
+    # Expira sob demanda qualquer tentativa vencida antes de reportar —
+    # assim a dashboard do professor nunca mostra "em andamento" para algo
+    # cujo prazo já passou (ver _expirar_se_vencida).
+    tentativas_atualizadas = []
+    for t in tentativas:
+        if t["status"] == "em_andamento":
+            t = _expirar_se_vencida(db, t)
+        tentativas_atualizadas.append(t)
+    tentativas = tentativas_atualizadas
+
+    por_aluno = {}
+    for t in tentativas:
+        por_aluno.setdefault(t["aluno_id"], []).append(t)
+
+    linhas = []
+    sem_tentativa = 0
+    em_andamento = 0
+    concluidas = 0
+
+    for aluno in alunos:
+        tentativas_aluno = por_aluno.get(aluno["id"], [])
+        if not tentativas_aluno:
+            sem_tentativa += 1
+            linhas.append({
+                "aluno": aluno,
+                "status": "pendente",
+                "tentativas": [],
+            })
+            continue
+
+        tem_andamento = any(t["status"] == "em_andamento" for t in tentativas_aluno)
+        tem_finalizada = any(t["status"] == "finalizada" for t in tentativas_aluno)
+
+        if tem_andamento:
+            em_andamento += 1
+        if tem_finalizada:
+            concluidas += 1
+
+        linhas.append({
+            "aluno": aluno,
+            "status": "em_andamento" if tem_andamento else ("concluida" if tem_finalizada else "pendente"),
+            "tentativas": [
+                {
+                    "id": t["id"],
+                    "numero_tentativa": t["numero_tentativa"],
+                    "status": t["status"],
+                    "nota": t.get("nota"),
+                    "acertos": t.get("acertos"),
+                    "erros": t.get("erros"),
+                    "em_branco": t.get("em_branco"),
+                    "iniciado_em": t["iniciado_em"],
+                    "finalizado_em": t.get("finalizado_em"),
+                    "motivo_encerramento": t.get("motivo_encerramento"),
+                }
+                for t in sorted(tentativas_aluno, key=lambda x: x["numero_tentativa"])
+            ],
+        })
+
+    return _success({
+        "quiz": {"id": quiz["id"], "titulo": quiz["titulo"], "tipo": quiz["tipo"]},
+        "resumo": {
+            "total_alunos": len(alunos),
+            "pendentes": sem_tentativa,
+            "em_andamento": em_andamento,
+            "concluidas": concluidas,
+        },
+        "linhas": linhas,
+    })
+
+
+# -----------------------------------------------------------------------------
+# GET /api/professor/quiz/<quiz_id>/analise
+# Análise por questão: taxa de erro, ordenada da maior para a menor, com
+# distribuição de alternativas. "Questões com maior taxa de erro e acesso
+# à análise de cada prova" (seção 02/04).
+#
+# Só considera tentativas FINALIZADAS (ver seção 04: "Separação entre
+# tentativas em andamento e resultados finalizados válidos").
+# -----------------------------------------------------------------------------
+@app.route("/api/professor/quiz/<quiz_id>/analise", methods=["GET"])
+@token_required
+@professor_required
+def analisar_quiz_por_questao(current_user, quiz_id):
+    db = get_user_supabase()
+
+    if not _uuid_valido(quiz_id):
+        return _error("ID do questionário inválido.", 400)
+
+    quiz = _quiz_do_professor(db, quiz_id, current_user["id"])
+    if not quiz:
+        return _error("Quiz não encontrado ou sem permissão.", 404)
+
+    perguntas = (
+        db.table("question")
+        .select("id, question, option_a, option_b, option_c, option_d, correct_answer, ordem")
+        .eq("quiz_id", quiz_id)
+        .order("ordem")
+        .execute().data or []
+    )
+    if not perguntas:
+        return _success({"quiz": {"id": quiz["id"], "titulo": quiz["titulo"]}, "questoes": []})
+
+    tentativas_finalizadas_ids = (
+        db.table("quiz_tentativa")
+        .select("id")
+        .eq("quiz_id", quiz_id)
+        .eq("status", "finalizada")
+        .execute().data or []
+    )
+    ids_validos = {t["id"] for t in tentativas_finalizadas_ids}
+
+    if not ids_validos:
+        # Nenhuma tentativa concluída ainda — devolve estrutura vazia, sem
+        # dividir por zero.
+        questoes_vazias = [{
+            "question_id": p["id"], "enunciado": p["question"], "ordem": p["ordem"],
+            "total_respostas": 0, "acertos": 0, "erros": 0, "em_branco": 0,
+            "taxa_erro": None, "distribuicao": {"a": 0, "b": 0, "c": 0, "d": 0},
+        } for p in perguntas]
+        return _success({
+            "quiz": {"id": quiz["id"], "titulo": quiz["titulo"]},
+            "questoes": questoes_vazias,
+        })
+
+    respostas = (
+        db.table("quiz_resposta_item")
+        .select("question_id, alternativa_marcada, correta, tentativa_id")
+        .in_("tentativa_id", list(ids_validos))
+        .execute().data or []
+    )
+
+    por_questao = {}
+    for r in respostas:
+        qid = r["question_id"]
+        por_questao.setdefault(qid, []).append(r)
+
+    questoes = []
+    for p in perguntas:
+        itens = por_questao.get(p["id"], [])
+        total = len(itens)
+        acertos = sum(1 for i in itens if i.get("correta"))
+        em_branco = sum(1 for i in itens if not i.get("alternativa_marcada"))
+        erros = total - acertos - em_branco
+        taxa_erro = round((erros / total) * 100, 1) if total > 0 else None
+
+        distribuicao = {"a": 0, "b": 0, "c": 0, "d": 0}
+        for i in itens:
+            alt = i.get("alternativa_marcada")
+            if alt in distribuicao:
+                distribuicao[alt] += 1
+
+        questoes.append({
+            "question_id": p["id"],
+            "enunciado": p["question"],
+            "ordem": p["ordem"],
+            "correta_gabarito": p["correct_answer"],
+            "total_respostas": total,
+            "acertos": acertos,
+            "erros": erros,
+            "em_branco": em_branco,
+            "taxa_erro": taxa_erro,
+            "distribuicao": distribuicao,
+        })
+
+    # Maiores taxas de erro primeiro; questões sem nenhuma resposta ainda
+    # (taxa_erro None) vão para o final, não para o topo.
+    questoes.sort(key=lambda q: (q["taxa_erro"] is None, -(q["taxa_erro"] or 0)))
+
+    return _success({
+        "quiz": {"id": quiz["id"], "titulo": quiz["titulo"]},
+        "total_tentativas_consideradas": len(ids_validos),
+        "questoes": questoes,
+    })
+
+
+# -----------------------------------------------------------------------------
+# GET /api/professor/quiz-tentativa/<tentativa_id>
+# Visão individual: aluno, nota, cada alternativa marcada x gabarito,
+# início/conclusão/motivo, ocorrências técnicas (seção 04).
+# -----------------------------------------------------------------------------
+@app.route("/api/professor/quiz-tentativa/<tentativa_id>", methods=["GET"])
+@token_required
+@professor_required
+def ver_tentativa_professor(current_user, tentativa_id):
+    db = get_user_supabase()
+
+    if not _uuid_valido(tentativa_id):
+        return _error("ID da tentativa inválido.", 400)
+
+    tentativa_r = (
+        db.table("quiz_tentativa")
+        .select("*, perfis(id, nome, email), quiz(id, titulo, sala_id)")
+        .eq("id", tentativa_id)
+        .execute()
+    )
+    if not tentativa_r.data:
+        return _error("Tentativa não encontrada.", 404)
+
+    tentativa = tentativa_r.data[0]
+    quiz = tentativa.get("quiz") or {}
+    if not quiz.get("sala_id") or not _sala_do_professor(db, quiz["sala_id"], current_user["id"]):
+        return _error("Você não tem permissão para ver esta tentativa.", 403)
+
+    perguntas = (
+        db.table("question")
+        .select("id, question, option_a, option_b, option_c, option_d, correct_answer, ordem")
+        .eq("quiz_id", quiz["id"])
+        .order("ordem")
+        .execute().data or []
+    )
+    respostas = (
+        db.table("quiz_resposta_item")
+        .select("question_id, alternativa_marcada, correta, salvo_em")
+        .eq("tentativa_id", tentativa_id)
+        .execute().data or []
+    )
+    respostas_idx = {r["question_id"]: r for r in respostas}
+
+    ocorrencias = (
+        db.table("quiz_ocorrencia")
+        .select("*")
+        .eq("tentativa_id", tentativa_id)
+        .order("criado_em")
+        .execute().data or []
+    )
+
+    itens = []
+    for p in perguntas:
+        resp = respostas_idx.get(p["id"])
+        itens.append({
+            "question_id": p["id"],
+            "enunciado": p["question"],
+            "opcoes": {"a": p["option_a"], "b": p["option_b"], "c": p["option_c"], "d": p["option_d"]},
+            "correta_gabarito": p["correct_answer"],
+            "alternativa_marcada": resp["alternativa_marcada"] if resp else None,
+            "acertou": bool(resp and resp.get("correta")),
+            "salvo_em": resp["salvo_em"] if resp else None,
+            "ordem": p["ordem"],
+        })
+
+    return _success({
+        "aluno": tentativa.get("perfis"),
+        "quiz": {"id": quiz.get("id"), "titulo": quiz.get("titulo")},
+        "tentativa": {
+            "id": tentativa["id"],
+            "numero_tentativa": tentativa["numero_tentativa"],
+            "status": tentativa["status"],
+            "nota": tentativa.get("nota"),
+            "acertos": tentativa.get("acertos"),
+            "erros": tentativa.get("erros"),
+            "em_branco": tentativa.get("em_branco"),
+            "iniciado_em": tentativa["iniciado_em"],
+            "finalizado_em": tentativa.get("finalizado_em"),
+            "motivo_encerramento": tentativa.get("motivo_encerramento"),
+            "reaberta_por_professor_id": tentativa.get("reaberta_por_professor_id"),
+            "motivo_reabertura": tentativa.get("motivo_reabertura"),
+        },
+        "itens": itens,
+        "ocorrencias": ocorrencias,
+    })
+
+
+# -----------------------------------------------------------------------------
+# POST /api/professor/quiz-tentativa/<tentativa_id>/reabrir
+# Reabertura por incidente: AUTORIZADA (só o professor da sala) e AUDITADA
+# (exige motivo em texto) — seção 05/06 do relatório.
+#
+# ⚠️  [A CONFIRMAR — Decisão 9 do documento enviado à Maya] por ora, QUALQUER
+# professor dono da sala pode reabrir, desde que informe o motivo. Ajustar
+# aqui se a decisão final exigir uma segunda aprovação ou papel diferente.
+# -----------------------------------------------------------------------------
+@app.route("/api/professor/quiz-tentativa/<tentativa_id>/reabrir", methods=["POST"])
+@token_required
+@professor_required
+def reabrir_tentativa(current_user, tentativa_id):
+    db = get_user_supabase()
+    professor_id = current_user["id"]
+
+    if not _uuid_valido(tentativa_id):
+        return _error("ID da tentativa inválido.", 400)
+
+    body = request.get_json(silent=True) or {}
+    motivo = (body.get("motivo") or "").strip()
+    if not motivo:
+        return _error(
+            "Informe o motivo da reabertura (obrigatório para auditoria).",
+            400,
+        )
+
+    tentativa_r = (
+        db.table("quiz_tentativa")
+        .select("*, quiz(id, sala_id)")
+        .eq("id", tentativa_id)
+        .execute()
+    )
+    if not tentativa_r.data:
+        return _error("Tentativa não encontrada.", 404)
+
+    tentativa = tentativa_r.data[0]
+    quiz = tentativa.get("quiz") or {}
+    if not quiz.get("sala_id") or not _sala_do_professor(db, quiz["sala_id"], professor_id):
+        return _error("Você não tem permissão para reabrir esta tentativa.", 403)
+
+    if tentativa["status"] == "em_andamento":
+        return _error("Esta tentativa já está em andamento.", 409)
+
+    try:
+        upd = (
+            db.table("quiz_tentativa")
+            .update({
+                "status": "em_andamento",
+                "finalizado_em": None,
+                "motivo_encerramento": None,
+                "nota": None,
+                "acertos": None,
+                "erros": None,
+                "em_branco": None,
+                "reaberta_por_professor_id": professor_id,
+                "motivo_reabertura": motivo,
+            })
+            .eq("id", tentativa_id)
+            .execute()
+        )
+        if not upd.data:
+            return _error("Não foi possível reabrir esta tentativa.", 500)
+
+        _criar_notificacao(
+            db,
+            tentativa["aluno_id"],
+            "Sua tentativa foi reaberta",
+            f"O professor reabriu sua tentativa na prova \"{quiz.get('titulo', '')}\". "
+            f"Motivo: {motivo}",
+        )
+
+        return _success({
+            "message": "Tentativa reaberta. O aluno foi notificado.",
+            "tentativa": upd.data[0],
+        })
+
+    except Exception:
+        app.logger.exception("Erro ao reabrir tentativa de quiz.")
+        return _error("Não foi possível reabrir a tentativa. Tente novamente.", 500)
+
+# -----------------------------------------------------------------------------
+# PATCH 3 — NOVAS ROTAS DO PROFESSOR para a Decisão 4 (prova não realizada)
+# -----------------------------------------------------------------------------
+@app.route("/api/professor/quiz/<quiz_id>/alunos/<aluno_id>/justificar-ausencia", methods=["POST"])
+@token_required
+@professor_required
+def justificar_ausencia_quiz(current_user, quiz_id, aluno_id):
+    """
+    Registra que a ausência do aluno nesta prova foi justificada: fica
+    marcada no histórico, mas continua FORA do cálculo da média (não vira
+    zero). Só é permitida se o aluno realmente não tiver nenhuma tentativa
+    vigente (evita confundir com uma prova já respondida).
+    """
+    db = get_user_supabase()
+    quiz = _quiz_do_professor(db, quiz_id, current_user["id"])
+    if not quiz:
+        return _error("Quiz não encontrado ou sem permissão.", 404)
+
+    body = request.get_json(silent=True) or {}
+    motivo = (body.get("motivo") or "").strip()
+    if not motivo:
+        return _error("Informe o motivo da justificativa.", 400)
+
+    existente = (
+        db.table("quiz_tentativa")
+        .select("id")
+        .eq("quiz_id", quiz_id)
+        .eq("aluno_id", aluno_id)
+        .neq("status", "substituida")
+        .execute().data
+    )
+    if existente:
+        return _error("Este aluno já possui uma tentativa registrada nesta prova.", 409)
+
+    try:
+        ins = db.table("quiz_tentativa").insert({
+            "aluno_id": aluno_id,
+            "quiz_id": quiz_id,
+            "numero_tentativa": 1,
+            "status": "ausencia_justificada",
+            "motivo_encerramento": "ausencia_justificada",
+            "motivo_reabertura": motivo,  # reaproveita o campo de auditoria
+            "reaberta_por_professor_id": current_user["id"],
+            "registrado_por_professor_id": current_user["id"],
+            "finalizado_em": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        if not ins.data:
+            return _error("Não foi possível registrar a justificativa.", 500)
+        return _success({"message": "Ausência justificada. Fica fora do cálculo da média.", "tentativa": ins.data[0]})
+    except Exception:
+        app.logger.exception("Erro ao justificar ausência.")
+        return _error("Não foi possível registrar a justificativa. Tente novamente.", 500)
+
+
+@app.route("/api/professor/quiz/<quiz_id>/alunos/<aluno_id>/atribuir-zero", methods=["POST"])
+@token_required
+@professor_required
+def atribuir_zero_quiz(current_user, quiz_id, aluno_id):
+    """
+    Professor registra nota 0 manualmente para um aluno que não fez a
+    prova (Decisão 4: "o professor pode registrar zero"). Diferente de
+    justificar ausência: ESTE resultado ENTRA no cálculo da média, com
+    nota 0 — é uma decisão explícita do professor, nunca automática.
+    """
+    db = get_user_supabase()
+    quiz = _quiz_do_professor(db, quiz_id, current_user["id"])
+    if not quiz:
+        return _error("Quiz não encontrado ou sem permissão.", 404)
+
+    body = request.get_json(silent=True) or {}
+    motivo = (body.get("motivo") or "").strip()
+    if not motivo:
+        return _error("Informe o motivo da atribuição de zero.", 400)
+
+    existente = (
+        db.table("quiz_tentativa")
+        .select("id")
+        .eq("quiz_id", quiz_id)
+        .eq("aluno_id", aluno_id)
+        .neq("status", "substituida")
+        .execute().data
+    )
+    if existente:
+        return _error("Este aluno já possui uma tentativa registrada nesta prova.", 409)
+
+    try:
+        ins = db.table("quiz_tentativa").insert({
+            "aluno_id": aluno_id,
+            "quiz_id": quiz_id,
+            "numero_tentativa": 1,
+            "status": "ausencia_justificada",  # mesmo "balde" de decisão administrativa
+            "motivo_encerramento": "zero_atribuido_professor",
+            "motivo_reabertura": motivo,
+            "reaberta_por_professor_id": current_user["id"],
+            "registrado_por_professor_id": current_user["id"],
+            "nota": 0,
+            "acertos": 0,
+            "em_branco": 0,
+            "finalizado_em": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        if not ins.data:
+            return _error("Não foi possível atribuir a nota.", 500)
+        return _success({"message": "Zero atribuído. Este resultado entra na média do aluno.", "tentativa": ins.data[0]})
+    except Exception:
+        app.logger.exception("Erro ao atribuir zero.")
+        return _error("Não foi possível atribuir a nota. Tente novamente.", 500)
+
+
+# -----------------------------------------------------------------------------
+# PATCH 4 — NOVA ROTA: autorizar nova tentativa de prova (Decisões 6 e 7)
+#
+# Diferente de reabrir_tentativa (que volta a MESMA tentativa para
+# em_andamento, usado em incidentes técnicos): aqui a tentativa anterior é
+# marcada como 'substituida' (fica no histórico, não conta na média) e uma
+# tentativa NOVA é criada para o aluno responder do zero.
+# -----------------------------------------------------------------------------
+@app.route("/api/professor/quiz-tentativa/<tentativa_id>/autorizar-nova-tentativa", methods=["POST"])
+@token_required
+@professor_required
+def autorizar_nova_tentativa(current_user, tentativa_id):
+    db = get_user_supabase()
+    professor_id = current_user["id"]
+
+    if not _uuid_valido(tentativa_id):
+        return _error("ID da tentativa inválido.", 400)
+
+    body = request.get_json(silent=True) or {}
+    motivo = (body.get("motivo") or "").strip()
+    if not motivo:
+        return _error("Informe o motivo da nova tentativa (obrigatório para auditoria).", 400)
+
+    tentativa_r = (
+        db.table("quiz_tentativa")
+        .select("*, quiz(id, sala_id, titulo)")
+        .eq("id", tentativa_id)
+        .execute()
+    )
+    if not tentativa_r.data:
+        return _error("Tentativa não encontrada.", 404)
+
+    tentativa = tentativa_r.data[0]
+    quiz = tentativa.get("quiz") or {}
+    if not quiz.get("sala_id") or not _sala_do_professor(db, quiz["sala_id"], professor_id):
+        return _error("Você não tem permissão para autorizar esta ação.", 403)
+
+    if tentativa["status"] == "em_andamento":
+        return _error("Esta tentativa ainda está em andamento.", 409)
+
+    try:
+        # 1) Marca a anterior como substituída (fica no histórico, não
+        #    entra mais na média — Decisão 7)
+        upd = (
+            db.table("quiz_tentativa")
+            .update({
+                "status": "substituida",
+                "reaberta_por_professor_id": professor_id,
+                "motivo_reabertura": motivo,
+            })
+            .eq("id", tentativa_id)
+            .execute()
+        )
+        if not upd.data:
+            return _error("Não foi possível marcar a tentativa anterior como substituída.", 500)
+
+        # 2) Cria a tentativa nova, pronta para o aluno iniciar (sem
+        #    expires_at ainda — só é calculado quando o aluno de fato
+        #    iniciar, via POST .../iniciar, igual a qualquer outra)
+        nova = (
+            db.table("quiz_tentativa")
+            .insert({
+                "aluno_id": tentativa["aluno_id"],
+                "quiz_id": tentativa["quiz_id"],
+                "numero_tentativa": tentativa["numero_tentativa"] + 1,
+                "status": "em_andamento",
+                "iniciado_em": datetime.now(timezone.utc).isoformat(),
+                "reaberta_por_professor_id": professor_id,
+                "motivo_reabertura": motivo,
+            })
+            .execute()
+        )
+        if not nova.data:
+            return _error("A tentativa anterior foi substituída, mas a nova não pôde ser criada.", 500)
+
+        _criar_notificacao(
+            db,
+            tentativa["aluno_id"],
+            "Nova tentativa autorizada",
+            f"O professor autorizou uma nova tentativa na prova \"{quiz.get('titulo', '')}\". "
+            f"Motivo: {motivo}",
+        )
+
+        return _success({
+            "message": "Nova tentativa autorizada. O aluno foi notificado e já pode iniciá-la.",
+            "tentativa_substituida": upd.data[0],
+            "tentativa_nova": nova.data[0],
+        })
+
+    except Exception:
+        app.logger.exception("Erro ao autorizar nova tentativa.")
+        return _error("Não foi possível autorizar a nova tentativa. Tente novamente.", 500)
+
 
 if __name__ == "__main__":
     app.run(debug=True)
