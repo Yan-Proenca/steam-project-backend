@@ -5088,7 +5088,8 @@ def ver_estado_tentativa_quiz(current_user, quiz_id):
         tentativa_ativa = _expirar_se_vencida(db, tentativa_ativa)
 
     finalizadas = [t for t in tentativas if t["status"] == "finalizada"]
-    pode_iniciar_nova = len(tentativas) < quiz.get("tentativas_permitidas", 1)
+    limite = quiz.get("tentativas_permitidas")
+    pode_iniciar_nova = limite is None or len([t for t in tentativas if t["status"] != "substituida"]) < limite
 
     return _success({
         "quiz": {
