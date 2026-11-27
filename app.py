@@ -2,7 +2,6 @@ import os
 import json
 import re
 import functools
-import time
 import uuid
 import requests
 from datetime import datetime, timezone
@@ -2862,14 +2861,14 @@ def editar_quiz(current_user, sala_id, quiz_id):
         "periodo_id",
         "missao_id",
         "perguntas",
-        # --- campos de avaliação (mesmos aceitos na criação) ---
+        # --- NOVO: mesmos campos aceitos na criação (POST), agora editáveis ---
         "tipo",
         "peso",
         "duracao_minutos",
         "encerrar_ao_sair_guia",
         "politica_revisao",
         "janela_abre_em",
-        "janela_fecha_em"
+        "janela_fecha_em",
     }
 
     campos_desconhecidos = set(body.keys()) - campos_permitidos
@@ -2906,16 +2905,7 @@ def editar_quiz(current_user, sala_id, quiz_id):
         .data
     )
 
-    tentativas_novo_fluxo = (
-        db.table("quiz_tentativa")
-        .select("id")
-        .eq("quiz_id", quiz_id)
-        .limit(1)
-        .execute()
-        .data
-    )
-
-    if tentativas or tentativas_novo_fluxo:
+    if tentativas:
         return _error(
             "Este questionário já possui respostas registradas e não pode ser editado.",
             409
@@ -3025,31 +3015,24 @@ def editar_quiz(current_user, sala_id, quiz_id):
 
         dados_atualizacao["missao_id"] = missao_id
 
-    # ------------------------------------------------------------------
-    # Campos de avaliação (mesmas regras do criar_quiz)
-    # ------------------------------------------------------------------
+    # --- NOVO: tipo (treino | avaliativo) -----------------------------------
+    # Mudar o tipo depois de criado recalcula tentativas_permitidas junto,
+    # com a mesma regra da criação (Decisão 6): treino = ilimitado (None),
+    # avaliativo = 1 (nova tentativa só nasce via autorização do professor).
     if "tipo" in body:
-        tipo_raw = body["tipo"]
+        tipo = body["tipo"]
 
-        if (
-            not isinstance(tipo_raw, str)
-            or tipo_raw.strip().lower() not in ("treino", "avaliativo")
-        ):
+        if not isinstance(tipo, str) or tipo.strip().lower() not in ("treino", "avaliativo"):
             return _error("Tipo inválido. Utilize 'treino' ou 'avaliativo'.", 400)
 
-        tipo_novo = tipo_raw.strip().lower()
-        dados_atualizacao["tipo"] = tipo_novo
+        tipo = tipo.strip().lower()
 
-        # Decisão 6: treino = ilimitado (None); avaliativo = sempre 1.
-        dados_atualizacao["tentativas_permitidas"] = (
-            None if tipo_novo == "treino" else 1
-        )
+        dados_atualizacao["tipo"] = tipo
+        dados_atualizacao["tentativas_permitidas"] = None if tipo == "treino" else 1
 
+    # --- NOVO: peso (peso individual desta prova dentro do grupo de provas) -
     if "peso" in body:
         peso_raw = body["peso"]
-
-        if isinstance(peso_raw, bool):
-            return _error("O peso precisa ser um número.", 400)
 
         try:
             peso = float(peso_raw)
@@ -3061,14 +3044,12 @@ def editar_quiz(current_user, sala_id, quiz_id):
 
         dados_atualizacao["peso"] = peso
 
+    # --- NOVO: duração opcional em minutos (None = sem limite) -------------
     if "duracao_minutos" in body:
         duracao_raw = body["duracao_minutos"]
         duracao_minutos = None
 
         if duracao_raw not in (None, ""):
-            if isinstance(duracao_raw, bool):
-                return _error("A duração precisa ser um número inteiro de minutos.", 400)
-
             try:
                 duracao_minutos = int(duracao_raw)
             except (ValueError, TypeError):
@@ -3079,48 +3060,46 @@ def editar_quiz(current_user, sala_id, quiz_id):
 
         dados_atualizacao["duracao_minutos"] = duracao_minutos
 
+    # --- NOVO: encerrar ao sair da guia -------------------------------------
     if "encerrar_ao_sair_guia" in body:
-        if not isinstance(body["encerrar_ao_sair_guia"], bool):
-            return _error(
-                "O campo 'encerrar_ao_sair_guia' precisa ser verdadeiro ou falso.",
-                400
-            )
+        dados_atualizacao["encerrar_ao_sair_guia"] = bool(body["encerrar_ao_sair_guia"])
 
-        dados_atualizacao["encerrar_ao_sair_guia"] = body["encerrar_ao_sair_guia"]
-
+    # --- NOVO: política de revisão ------------------------------------------
     if "politica_revisao" in body:
-        if body["politica_revisao"] not in ("ao_finalizar", "apos_janela"):
+        politica_revisao = body["politica_revisao"]
+
+        if politica_revisao not in ("ao_finalizar", "apos_janela"):
             return _error("Política de revisão inválida.", 400)
 
-        dados_atualizacao["politica_revisao"] = body["politica_revisao"]
+        dados_atualizacao["politica_revisao"] = politica_revisao
 
+    # --- NOVO: janela de aplicação opcional ---------------------------------
+    # Mescla com o valor já salvo quando só um dos dois lados vem no body,
+    # para checar coerência (fim > início) contra o estado real do quiz.
     if "janela_abre_em" in body or "janela_fecha_em" in body:
-        # Valor final de cada ponta = o que veio no body, ou o que já está salvo.
-        abre_final = (
-            (body.get("janela_abre_em") or None)
-            if "janela_abre_em" in body
+        janela_abre_em = (
+            body["janela_abre_em"] if "janela_abre_em" in body
             else quiz_atual.get("janela_abre_em")
-        )
-        fecha_final = (
-            (body.get("janela_fecha_em") or None)
-            if "janela_fecha_em" in body
+        ) or None
+        janela_fecha_em = (
+            body["janela_fecha_em"] if "janela_fecha_em" in body
             else quiz_atual.get("janela_fecha_em")
-        )
+        ) or None
 
-        inicio = _parse_dt(abre_final) if abre_final else None
-        fim = _parse_dt(fecha_final) if fecha_final else None
+        if janela_abre_em and janela_fecha_em:
+            inicio = _parse_dt(janela_abre_em)
+            fim = _parse_dt(janela_fecha_em)
 
-        if (abre_final and not inicio) or (fecha_final and not fim):
-            return _error("Datas de janela inválidas.", 400)
+            if not inicio or not fim:
+                return _error("Datas de janela inválidas.", 400)
 
-        if inicio and fim and fim <= inicio:
-            return _error("O fim da janela precisa ser depois do início.", 400)
+            if fim <= inicio:
+                return _error("O fim da janela precisa ser depois do início.", 400)
 
         if "janela_abre_em" in body:
-            dados_atualizacao["janela_abre_em"] = abre_final
-
+            dados_atualizacao["janela_abre_em"] = janela_abre_em
         if "janela_fecha_em" in body:
-            dados_atualizacao["janela_fecha_em"] = fecha_final
+            dados_atualizacao["janela_fecha_em"] = janela_fecha_em
 
     novas_perguntas = None
 
@@ -3152,7 +3131,7 @@ def editar_quiz(current_user, sala_id, quiz_id):
             "tentativas_permitidas",
             "politica_revisao",
             "janela_abre_em",
-            "janela_fecha_em"
+            "janela_fecha_em",
         )
     }
 
@@ -3622,67 +3601,6 @@ def excluir_material(current_user, sala_id, material_id):
 # =============================================================================
 # PROFESSOR — GERAÇÃO DE QUIZ COM GEMINI (não acessa dados de sala/aluno)
 # =============================================================================
-# Modelos configuráveis por variável de ambiente. O fallback só é usado quando
-# o principal responde com erro temporário (503/429/500/504).
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
-GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
-
-# Erros do Gemini que valem uma nova tentativa (sobrecarga / limite / instabilidade).
-_GEMINI_CODIGOS_TEMPORARIOS = {429, 500, 503, 504}
-
-
-def _gemini_gerar_json(prompt):
-    """
-    Chama o Gemini com tentativas limitadas para absorver picos de demanda (503).
-    Ordem: modelo principal (2 tentativas) -> modelo de fallback (1 tentativa).
-    O tempo total é mantido curto de propósito: o front/Vercel tem timeout, e
-    esperar demais troca um erro claro por "O servidor demorou para responder".
-    Levanta a última exceção se todas as tentativas falharem.
-    """
-    tentativas = [
-        (GEMINI_MODEL, 0),
-        (GEMINI_MODEL, 1.5),
-    ]
-    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
-        tentativas.append((GEMINI_FALLBACK_MODEL, 0.5))
-
-    ultimo_erro = None
-
-    for modelo, espera in tentativas:
-        if espera:
-            time.sleep(espera)
-
-        try:
-            response = genai_client.models.generate_content(
-                model=modelo,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
-                ),
-            )
-            return json.loads(response.text)
-
-        except json.JSONDecodeError as e:
-            # Resposta veio mas não era JSON válido: vale tentar de novo.
-            ultimo_erro = e
-            app.logger.warning("Gemini (%s) devolveu JSON inválido.", modelo)
-
-        except Exception as e:
-            ultimo_erro = e
-            codigo = getattr(e, "code", None)
-
-            if codigo in _GEMINI_CODIGOS_TEMPORARIOS:
-                app.logger.warning("Gemini (%s) indisponível (%s); tentando novamente.", modelo, codigo)
-                continue
-
-            # Erro permanente (chave inválida, modelo inexistente, prompt
-            # bloqueado...): repetir não adianta para este modelo, mas o
-            # fallback ainda pode funcionar (ex.: nome de modelo errado).
-            app.logger.exception("Gemini (%s) falhou com erro não temporário.", modelo)
-
-    raise ultimo_erro
-
-
 @app.route("/api/professor/gemini/gerar-quiz", methods=["POST"])
 @token_required
 @professor_required
@@ -3690,17 +3608,10 @@ def gerar_quiz_gemini(current_user):
     if genai_client is None:
         return _error("Serviço de geração de quiz indisponível (GEMINI_API_KEY não configurada).", 500)
 
-    body = request.get_json(silent=True) or {}
-    tema = str(body.get("tema", "")).strip()
+    body = request.get_json() or {}
+    tema = body.get("tema", "").strip()
+    quantidade = int(body.get("quantidade", 5) or 5)
     dificuldade = body.get("dificuldade", "medio")
-
-    try:
-        quantidade = int(body.get("quantidade", 5) or 5)
-    except (ValueError, TypeError):
-        return _error("A quantidade de perguntas precisa ser um número inteiro.")
-
-    if not 1 <= quantidade <= 20:
-        return _error("A quantidade de perguntas deve ficar entre 1 e 20.")
 
     if not tema:
         return _error("Informe o tema do quiz.")
@@ -3713,24 +3624,15 @@ def gerar_quiz_gemini(current_user):
     )
 
     try:
-        dados = _gemini_gerar_json(prompt)
+        response = genai_client.models.generate_content(
+            model="gemini-3.7-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        dados = json.loads(response.text)
         return _success(dados)
-
     except Exception as e:
-        app.logger.exception("Erro ao gerar quiz com Gemini.")
-        codigo = getattr(e, "code", None)
-
-        if codigo in _GEMINI_CODIGOS_TEMPORARIOS:
-            return _error(
-                "O serviço de IA está com alta demanda no momento. "
-                "Aguarde alguns segundos e tente gerar novamente.",
-                503
-            )
-
-        if isinstance(e, json.JSONDecodeError):
-            return _error("A IA devolveu uma resposta fora do formato esperado. Tente gerar novamente.", 502)
-
-        return _error("Não foi possível gerar o quiz agora. Tente novamente.", 500)
+        return _error(f"Erro ao gerar quiz: {str(e)}", 500)
 
 
 # =============================================================================
@@ -5088,8 +4990,7 @@ def ver_estado_tentativa_quiz(current_user, quiz_id):
         tentativa_ativa = _expirar_se_vencida(db, tentativa_ativa)
 
     finalizadas = [t for t in tentativas if t["status"] == "finalizada"]
-    limite = quiz.get("tentativas_permitidas")
-    pode_iniciar_nova = limite is None or len([t for t in tentativas if t["status"] != "substituida"]) < limite
+    pode_iniciar_nova = len(tentativas) < quiz.get("tentativas_permitidas", 1)
 
     return _success({
         "quiz": {
