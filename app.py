@@ -2860,7 +2860,15 @@ def editar_quiz(current_user, sala_id, quiz_id):
         "sticker_reward_id",
         "periodo_id",
         "missao_id",
-        "perguntas"
+        "perguntas",
+        # --- campos de avaliação (mesmos aceitos na criação) ---
+        "tipo",
+        "peso",
+        "duracao_minutos",
+        "encerrar_ao_sair_guia",
+        "politica_revisao",
+        "janela_abre_em",
+        "janela_fecha_em"
     }
 
     campos_desconhecidos = set(body.keys()) - campos_permitidos
@@ -2897,7 +2905,16 @@ def editar_quiz(current_user, sala_id, quiz_id):
         .data
     )
 
-    if tentativas:
+    tentativas_novo_fluxo = (
+        db.table("quiz_tentativa")
+        .select("id")
+        .eq("quiz_id", quiz_id)
+        .limit(1)
+        .execute()
+        .data
+    )
+
+    if tentativas or tentativas_novo_fluxo:
         return _error(
             "Este questionário já possui respostas registradas e não pode ser editado.",
             409
@@ -3007,6 +3024,103 @@ def editar_quiz(current_user, sala_id, quiz_id):
 
         dados_atualizacao["missao_id"] = missao_id
 
+    # ------------------------------------------------------------------
+    # Campos de avaliação (mesmas regras do criar_quiz)
+    # ------------------------------------------------------------------
+    if "tipo" in body:
+        tipo_raw = body["tipo"]
+
+        if (
+            not isinstance(tipo_raw, str)
+            or tipo_raw.strip().lower() not in ("treino", "avaliativo")
+        ):
+            return _error("Tipo inválido. Utilize 'treino' ou 'avaliativo'.", 400)
+
+        tipo_novo = tipo_raw.strip().lower()
+        dados_atualizacao["tipo"] = tipo_novo
+
+        # Decisão 6: treino = ilimitado (None); avaliativo = sempre 1.
+        dados_atualizacao["tentativas_permitidas"] = (
+            None if tipo_novo == "treino" else 1
+        )
+
+    if "peso" in body:
+        peso_raw = body["peso"]
+
+        if isinstance(peso_raw, bool):
+            return _error("O peso precisa ser um número.", 400)
+
+        try:
+            peso = float(peso_raw)
+        except (ValueError, TypeError):
+            return _error("O peso precisa ser um número.", 400)
+
+        if peso <= 0:
+            return _error("O peso precisa ser maior que zero.", 400)
+
+        dados_atualizacao["peso"] = peso
+
+    if "duracao_minutos" in body:
+        duracao_raw = body["duracao_minutos"]
+        duracao_minutos = None
+
+        if duracao_raw not in (None, ""):
+            if isinstance(duracao_raw, bool):
+                return _error("A duração precisa ser um número inteiro de minutos.", 400)
+
+            try:
+                duracao_minutos = int(duracao_raw)
+            except (ValueError, TypeError):
+                return _error("A duração precisa ser um número inteiro de minutos.", 400)
+
+            if duracao_minutos <= 0:
+                return _error("A duração precisa ser maior que zero.", 400)
+
+        dados_atualizacao["duracao_minutos"] = duracao_minutos
+
+    if "encerrar_ao_sair_guia" in body:
+        if not isinstance(body["encerrar_ao_sair_guia"], bool):
+            return _error(
+                "O campo 'encerrar_ao_sair_guia' precisa ser verdadeiro ou falso.",
+                400
+            )
+
+        dados_atualizacao["encerrar_ao_sair_guia"] = body["encerrar_ao_sair_guia"]
+
+    if "politica_revisao" in body:
+        if body["politica_revisao"] not in ("ao_finalizar", "apos_janela"):
+            return _error("Política de revisão inválida.", 400)
+
+        dados_atualizacao["politica_revisao"] = body["politica_revisao"]
+
+    if "janela_abre_em" in body or "janela_fecha_em" in body:
+        # Valor final de cada ponta = o que veio no body, ou o que já está salvo.
+        abre_final = (
+            (body.get("janela_abre_em") or None)
+            if "janela_abre_em" in body
+            else quiz_atual.get("janela_abre_em")
+        )
+        fecha_final = (
+            (body.get("janela_fecha_em") or None)
+            if "janela_fecha_em" in body
+            else quiz_atual.get("janela_fecha_em")
+        )
+
+        inicio = _parse_dt(abre_final) if abre_final else None
+        fim = _parse_dt(fecha_final) if fecha_final else None
+
+        if (abre_final and not inicio) or (fecha_final and not fim):
+            return _error("Datas de janela inválidas.", 400)
+
+        if inicio and fim and fim <= inicio:
+            return _error("O fim da janela precisa ser depois do início.", 400)
+
+        if "janela_abre_em" in body:
+            dados_atualizacao["janela_abre_em"] = abre_final
+
+        if "janela_fecha_em" in body:
+            dados_atualizacao["janela_fecha_em"] = fecha_final
+
     novas_perguntas = None
 
     if "perguntas" in body:
@@ -3029,7 +3143,15 @@ def editar_quiz(current_user, sala_id, quiz_id):
             "xp_reward",
             "sticker_reward_id",
             "periodo_id",
-            "missao_id"
+            "missao_id",
+            "tipo",
+            "peso",
+            "duracao_minutos",
+            "encerrar_ao_sair_guia",
+            "tentativas_permitidas",
+            "politica_revisao",
+            "janela_abre_em",
+            "janela_fecha_em"
         )
     }
 
